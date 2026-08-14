@@ -1483,6 +1483,7 @@ function _scheduleMessageVirtualizedRender(force){
       _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
     }
     finally{ _msgNodeRecycleEnabled=false; }
+    _messageVirtualWindowKey=liveKey;
   });
 }
 
@@ -6128,8 +6129,8 @@ if(typeof window!=='undefined'){
   },{capture:true,passive:true});
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
-    _scheduleMessageVirtualizedRender();
     if(_freshProgrammaticScrollActive()) return;
+    _scheduleMessageVirtualizedRender();
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
