@@ -88,10 +88,20 @@ def _messages_scroll_listener_body() -> str:
 def test_scroll_listener_checks_programmatic_guard_before_scheduling_virtualized_render():
     """The _programmaticScroll guard must run before _scheduleMessageVirtualizedRender()
     so a render's own scrollTop write cannot re-enter the virtualized-render
-    trigger while still marked programmatic (#6799)."""
+    trigger while still marked programmatic (#6799).
+
+    The listener also has an unconditional _messageJumpScrollOwner branch
+    (#6621) that calls _scheduleMessageVirtualizedRender() before the guard
+    on purpose -- it must keep the virtualized window following an in-flight
+    "jump to answer" scroll regardless of the guard's freshness window. That
+    branch always returns before reaching the guard, so its schedule call is
+    unrelated to this regression: the guard text is unique in the listener
+    body, so locate it first, then look for the (non-jump-path) schedule
+    call after it, ignoring the earlier jump-branch occurrence.
+    """
     body = _messages_scroll_listener_body()
     guard_idx = body.index("if(_freshProgrammaticScrollActive()) return;")
-    schedule_idx = body.index("_scheduleMessageVirtualizedRender();")
+    schedule_idx = body.index("_scheduleMessageVirtualizedRender();", guard_idx)
     assert guard_idx < schedule_idx, (
         "_scheduleMessageVirtualizedRender() must be called AFTER the "
         "_freshProgrammaticScrollActive() guard, not before -- otherwise a "
