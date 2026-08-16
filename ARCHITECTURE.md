@@ -542,6 +542,38 @@ Known gaps:
 - Nested lists: single regex pass, multi-level indentation not handled
 - Mixed bold+link in same line: may produce garbled output
 
+Per-message render cache (`_renderCache`, ui.js ~1490-1560):
+    renderMessages() re-walks every visible message on every rebuild (it
+    fires twice per turn — see Section 6), and each message's body HTML is
+    fetched through _getCachedRender(text, isUser) rather than calling
+    renderMd()/_renderUserFencedBlocks() directly. _getCachedRender memoizes
+    the rendered HTML in a module-level Map (_renderCache), keyed by
+    _renderCacheKey(text, isUser) — role/render-mode prefix + the message
+    text itself (short text) or role prefix + length + an FNV-1a hash of the
+    full text (text over 500 chars, so two long messages can never collide
+    on a sampled key). Because the key is content-derived, an edited message
+    (submitEdit()/regenerateResponse() truncate S.messages and re-send new
+    text) naturally misses the cache — no explicit invalidation call is
+    needed. Eviction is LRU (delete+re-insert on hit, evict the oldest Map
+    key at _renderCacheMax=500 entries) rather than clearing the whole
+    cache, so a long/multi-session conversation doesn't thrash by discarding
+    its entire working set every time the cap is crossed.
+    This cache absorbs most of the O(n) markdown-recompute cost that would
+    otherwise repeat on every renderMessages() call — its own comment notes
+    "~95% of messages are identical between renders." It is distinct from
+    _sessionHtmlCache (Section 6), which caches the whole rendered
+    transcript as one HTML string keyed by session_id and only serves
+    cross-session navigation back to an already-rendered session; in-session
+    updates (new message, SSE 'done', edits) always fall through to the
+    per-message loop where _renderCache does its work.
+    clearMessageRenderCache() clears both layers together (_clearRenderCache()
+    for _renderCache, plus _sessionHtmlCache.clear()) — see the
+    render_user_markdown toggle in panels.js for the canonical caller (#3870).
+    Post-processing (Prism highlightCode(), renderMermaidBlocks(),
+    renderKatexBlocks()) all gate on data-highlighted/data-rendered DOM
+    markers, so re-running them against a cache-hit row is already a cheap
+    no-op — no special-casing needed for cached rows there.
+
 ### 5.5 Model Label Resolution (Fixed in Sprint 1, reused by composer selector)
 
 B3 was resolved in Sprint 1. Current code uses a MODEL_LABELS dict:

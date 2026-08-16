@@ -1490,27 +1490,64 @@ function _scheduleMessageVirtualizedRender(force){
 // Long sessions re-render the same messages on every renderMessages() call.
 // Cache the rendered HTML so unchanged messages skip the expensive regex
 // pipeline entirely.  ~95% of messages are identical between renders.
+//
+// Eviction is LRU, not clear-all: a long conversation (200+ messages) plus
+// any edit/regenerate activity or multi-session use can hold more distinct
+// message bodies than the cap in normal use. Clearing the whole Map at the
+// cap discarded the entire working set at once and forced a full re-render
+// burst right when the cache mattered most. A Map preserves insertion
+// order, so "most recently used" is just "delete + re-insert on hit" and
+// eviction is "delete the first (oldest) key" — no extra structure needed.
 const _renderCache = new Map();
-const _renderCacheMax = 300;
+const _renderCacheMax = 500;
 function _clearRenderCache(){ _renderCache.clear(); }
+// Cheap whole-string hash (FNV-1a — the same algorithm
+// _messageRenderCacheSignature uses for its cross-session cache signature)
+// so long-message cache keys are content-addressed instead of sampled. The
+// previous `length + first-20 + last-20` key let two distinct long messages
+// with identical length and matching head/tail collide and silently serve
+// each other's rendered HTML; hashing the full string removes that
+// collision class at a cost still far below the ~15-pass regex render it
+// protects.
+function _fnv1aHash(str){
+  let hash=2166136261;
+  for(let i=0;i<str.length;i++){
+    hash^=str.charCodeAt(i);
+    hash=Math.imul(hash,16777619)>>>0;
+  }
+  return hash.toString(36);
+}
 function _renderCacheKey(text, isUser){
   // Fold render_user_markdown state into user-message keys so toggling the
   // setting invalidates cached plain-text renders (#3870).
   const p = isUser ? (window._renderUserMarkdown ? 'um' : 'u') : 'a';
-  // Short content: use the full string as key (cheap Map lookup).
-  // Long content: length + prefix + suffix is good enough — collisions on
-  // 20-char prefix+suffix are vanishingly rare for chat messages.
+  // Short content: use the full string as key (cheap Map lookup, and short
+  // enough that hashing buys nothing).
   if(text.length <= 500) return p + ':' + text;
-  return p + ':' + text.length + ':' + text.slice(0,20) + ':' + text.slice(-20);
+  // Long content: hash the full string instead of sampling a prefix+suffix,
+  // so distinct long messages can never collide on a shared key.
+  return p + ':' + text.length + ':' + _fnv1aHash(text);
 }
 function _getCachedRender(text, isUser){
   const key = _renderCacheKey(text, isUser);
   const hit = _renderCache.get(key);
-  if(hit !== undefined) return hit;
+  if(hit !== undefined){
+    // Bump recency: delete + re-insert moves this key to the end of the
+    // Map's iteration order, which the eviction below reads as "most
+    // recently used".
+    _renderCache.delete(key);
+    _renderCache.set(key, hit);
+    return hit;
+  }
   const rendered = isUser
     ? (window._renderUserMarkdown ? renderMd(text) : _renderUserFencedBlocks(text))
     : renderMd(_stripXmlToolCallsDisplay(String(text)));
-  if(_renderCache.size > _renderCacheMax) _renderCache.clear();
+  if(_renderCache.size >= _renderCacheMax){
+    // Evict the least-recently-used entry (the first key in iteration
+    // order) instead of clearing the whole cache.
+    const oldestKey = _renderCache.keys().next().value;
+    _renderCache.delete(oldestKey);
+  }
   _renderCache.set(key, rendered);
   return rendered;
 }
