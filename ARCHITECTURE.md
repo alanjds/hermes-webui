@@ -610,6 +610,70 @@ Desktop content-visibility (style.css, ui.js ~1278-1554, ~16505-16515,
     covers the JS mechanics (flag toggling, height memoization, CSS gating
     structure) but not actual browser paint/scroll behavior.
 
+marked.js + DOMPurify renderer (Step 3a — B8, Phase E "remaining" item,
+ui.js `renderMdViaMarked()` and helpers just after renderMd()):
+    A second, independent renderer alongside renderMd(), flag-gated via
+    window._useMarkedRenderer (default OFF — toggle with
+    window._setUseMarkedRenderer(true) in the console for evaluation; not
+    yet wired to a persisted setting). _getCachedRender() dispatches to
+    whichever renderer the flag selects, and folds the flag into the cache
+    key so toggling never serves a stale render from the other renderer.
+    marked and DOMPurify load from jsdelivr with SRI (index.html), same
+    eager+defer+integrity pattern as Prism — see tests/vendor/README.md for
+    the exact pinned versions (marked 18.0.9, DOMPurify 3.4.13) and where
+    to get matching test fixtures if those versions change.
+
+    Preserves, by construction rather than reimplementation — both
+    renderers call the SAME shared top-level helpers (hoisted out of
+    renderMd() specifically to make this possible; see the git history for
+    that refactor commit):
+      - mermaid/diff/patch/json/yaml/csv fenced blocks: _fencedCodeBlockHtml()
+      - workspace://, session://, file:// link rewriting: _markdownHref()
+      - data:image/* validation: _isSafeDataImageUri() (via a DOMPurify
+        uponSanitizeAttribute hook, not DOMPurify's own coarser data: handling)
+
+    KaTeX $$..$$/\[..\]/$..$/\(..\) delimiters are stashed (plain-text
+    placeholder tokens, not renderMd()'s NUL-byte stash scheme — this is an
+    independent pipeline) before marked parses the text and restored after
+    DOMPurify sanitizes it, mirroring renderMd()'s own math_stash approach;
+    a display-math placeholder that lands as its own paragraph gets
+    unwrapped out of the <p> marked puts around it afterward, matching
+    renderMd()'s own paragraph-wrap exclusion for katex-block.
+
+    Sanitization is entirely DOMPurify's job (ALLOWED_TAGS/ALLOWED_ATTR/
+    ALLOWED_URI_REGEXP in _markedDomPurifyConfig()) — NOT the old SAFE_TAGS/
+    _tag() allowlist, which stays in renderMd() unchanged. Verified against
+    the same class of payloads _tag() was written to stop (script tags, img
+    onerror, javascript:/vbscript: hrefs, non-base64 SVG data URIs, raw
+    data:text/html) via tests/test_marked_renderer.py, run in a real headless
+    Chromium page — DOMPurify needs a real DOM, so unlike renderMd()'s tests
+    this suite can't run under plain Node.
+
+    breaks:true is set deliberately: plain CommonMark's default (a single
+    newline inside a paragraph collapses to a space) would visibly reflow
+    the common case of LLM output relying on single newlines for line
+    breaks, since renderMd()'s paragraph-wrap step turns every remaining
+    single newline into <br>. Caught by manual real-browser verification
+    before landing, not by the ported-behavior test suite alone.
+
+    Known, deliberate differences from renderMd() (not preserved on
+    purpose — real CommonMark/GFM correctness improvements a full parser
+    gives for free): nested lists render as true nested <ul>/<ol> instead
+    of a flat list with a margin-left style hack (closes the "Nested lists:
+    single regex pass" gap noted in 5.4 above); task-list items
+    (`- [ ] x`) render as real (disabled) <input type="checkbox"> elements
+    instead of a static span+emoji glyph. A minor, non-security widening
+    also exists: DOMPurify's default ALLOWED_URI_REGEXP fallback accepts
+    some bare relative-looking src/href values (e.g. `src="x"`) that
+    renderMd()'s explicit _isSafeUrl() allowlist would reject outright —
+    still cannot execute script or navigate to javascript:/vbscript:/bare
+    data:, just a wider "renders as a broken/plain image or link" set.
+
+    NOT touched: the live SSE streaming path (static/messages.js's `smd`
+    parser) and _renderUserFencedBlocks() (the plain-text user-bubble
+    renderer used when render_user_markdown is off) — both are out of
+    scope for this replacement and keep their existing implementations.
+
 ### 5.5 Model Label Resolution (Fixed in Sprint 1, reused by composer selector)
 
 B3 was resolved in Sprint 1. Current code uses a MODEL_LABELS dict:
@@ -759,7 +823,7 @@ restriction from the UI yet (see ROADMAP.md Wave 4 for the plan).
 | B5  | High     | INFLIGHT in-memory only, lost on reload              | FIXED Sprint 1   | markInflight/clearInflight in localStorage |
 | B6  | Medium   | New sessions always use DEFAULT_WORKSPACE            | FIXED Sprint 3   | newSession() passes S.session.workspace to /api/session/new |
 | B7  | Medium   | Sidebar title overflow: missing min-width:0          | FIXED Sprint 1   | min-width:0 on .session-item |
-| B8  | Medium   | renderMd missing tables, nested lists                | PARTIAL Sprint 4 | Tables Sprint 2; nested lists improved Sprint 4; full fix still Phase E |
+| B8  | Medium   | renderMd missing tables, nested lists                | PARTIAL — 3a landed | Tables Sprint 2; nested lists improved Sprint 4; full fix (marked.js) implemented behind window._useMarkedRenderer (default OFF) — nested lists/task-list checkboxes render correctly there. Default flip to Step 3b once evaluated. |
 | B9  | Medium   | Empty assistant messages can render                  | FIXED Sprint 1   | loadSession() filters empty-text assistant messages |
 | B10 | Low      | Thinking dots stay during tool-running               | FIXED Sprint 3   | removeThinking() on first tool event; compact 'Running X...' row shown |
 | B11 | Low      | GET /api/session no-ID silently creates session      | FIXED Sprint 1   | Returns 400 with error message |
@@ -868,8 +932,13 @@ Completed across Sprints 5, 6, and 9:
    Loaded as standard `<script>` tags (not ES modules) in dependency order.
 4. Prism.js added for syntax highlighting (Sprint 8) via CDN, deferred load.
 
-Remaining: renderMd() is still a hand-rolled regex chain. Tables partially supported.
-Replacing with marked.js + DOMPurify is a future improvement (not blocking).
+Remaining: renderMd() is still the hand-rolled regex chain used by default.
+`renderMdViaMarked()` (marked.js + DOMPurify) exists alongside it, flag-gated
+via `window._useMarkedRenderer` (default OFF) — see Section 5.4's "marked.js +
+DOMPurify renderer" subsection and B8 above. Flipping the default on (Step 3b)
+is a future step once the flagged renderer is evaluated in real use; the old
+renderMd() stays in the codebase either way as the fallback path (see
+renderMdViaMarked()'s doc comment).
 
 ### Phase F: API Design Cleanup (Priority: Low, Effort: Medium)
 

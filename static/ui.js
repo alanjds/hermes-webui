@@ -1626,8 +1626,12 @@ function _fnv1aHash(str){
 }
 function _renderCacheKey(text, isUser){
   // Fold render_user_markdown state into user-message keys so toggling the
-  // setting invalidates cached plain-text renders (#3870).
-  const p = isUser ? (window._renderUserMarkdown ? 'um' : 'u') : 'a';
+  // setting invalidates cached plain-text renders (#3870). Also fold in the
+  // marked.js/DOMPurify renderer flag (Step 3a) — the two renderers produce
+  // different HTML for the same message, so a cache entry from one must
+  // never be served while the other is active.
+  const rendererTag = window._useMarkedRenderer ? 'm' : '';
+  const p = (isUser ? (window._renderUserMarkdown ? 'um' : 'u') : 'a') + rendererTag;
   // Short content: use the full string as key (cheap Map lookup, and short
   // enough that hashing buys nothing).
   if(text.length <= 500) return p + ':' + text;
@@ -1646,9 +1650,14 @@ function _getCachedRender(text, isUser){
     _renderCache.set(key, hit);
     return hit;
   }
+  // Step 3a: marked.js + DOMPurify, flag-gated (default OFF — see
+  // _setUseMarkedRenderer). Only replaces the settled/historical renderMd()
+  // path; the plain-text user-bubble renderer (_renderUserFencedBlocks, used
+  // when render_user_markdown is off) is untouched either way.
+  const useMarked = !!window._useMarkedRenderer;
   const rendered = isUser
-    ? (window._renderUserMarkdown ? renderMd(text) : _renderUserFencedBlocks(text))
-    : renderMd(_stripXmlToolCallsDisplay(String(text)));
+    ? (window._renderUserMarkdown ? (useMarked ? renderMdViaMarked(text) : renderMd(text)) : _renderUserFencedBlocks(text))
+    : (useMarked ? renderMdViaMarked(_stripXmlToolCallsDisplay(String(text))) : renderMd(_stripXmlToolCallsDisplay(String(text))));
   if(_renderCache.size >= _renderCacheMax){
     // Evict the least-recently-used entry (the first key in iteration
     // order) instead of clearing the whole cache.
@@ -8110,6 +8119,201 @@ function renderMd(raw){
   s=s.replace(/\x00Q(\d+)\x00/g,(_,i)=>_bq_stash[+i]);
   return s;
 }
+
+// ── marked.js + DOMPurify renderer (Step 3a — roadmap Phase E / bug B8) ───
+// Flag-gated replacement for renderMd()'s hand-rolled regex chain. Default
+// OFF: window._useMarkedRenderer is unset/false until explicitly toggled via
+// _setUseMarkedRenderer(true) (console, for evaluation — not yet wired to a
+// persisted setting, same convention as _setDesktopAssistantContentVisibility
+// above). _getCachedRender() checks the flag and dispatches accordingly.
+//
+// Preserves, by construction:
+//  - mermaid/diff/patch/json/yaml/csv fenced blocks: routed through the same
+//    _fencedCodeBlockHtml() helper renderMd() uses, so output is identical.
+//  - workspace://, session://, file:// link rewriting: routed through the
+//    same _markdownHref()/_isInternalSessionHref() helpers renderMd() uses.
+//  - data:image/* inline images: validated with the same _isSafeDataImageUri()
+//    predicate via a DOMPurify hook (see _installMarkedDomPurifyHooks).
+//  - KaTeX $$..$$, \[..\], $..$, \(..\) delimiters: stashed before marked
+//    parses the text and restored after DOMPurify sanitizes it, mirroring
+//    renderMd()'s own math_stash approach (see _stashMathForMarked /
+//    _restoreMathStash below).
+//  - Task-list checkboxes render as real (disabled) <input type="checkbox">
+//    elements — marked's native GFM behavior. The old renderer never
+//    implemented this (`- [ ] x` renders as literal bracket text), so this
+//    is a deliberate improvement, not a preserved behavior.
+//
+// NOT touched by this renderer: the live SSE streaming path (static/
+// messages.js's `smd` parser) and _renderUserFencedBlocks() (the simpler
+// user-bubble renderer) — both are explicitly out of scope (only the
+// settled/historical renderMd() path is being replaced) and keep using
+// their existing implementations.
+//
+// Sanitization is entirely DOMPurify's job here — NOT the old SAFE_TAGS/
+// _tag() allowlist, which stays in renderMd() unchanged.
+let _markedInstance=null;
+let _markedDomPurifyHooksInstalled=false;
+function _installMarkedDomPurifyHooks(){
+  if(_markedDomPurifyHooksInstalled) return;
+  if(typeof DOMPurify==='undefined'||typeof DOMPurify.addHook!=='function') return;
+  // data:image/* through <img src> gets the SAME validation renderMd()'s
+  // _mdImageHtml()/_inlineMediaHtmlForRef() apply elsewhere (strict format +
+  // base64/percent-encoded charset + 2MB cap) instead of DOMPurify's coarser
+  // built-in data: handling — anything that fails is dropped rather than
+  // silently loosened to "any data: URI".
+  DOMPurify.addHook('uponSanitizeAttribute', (node, data)=>{
+    if(data.attrName!=='src'||!node||node.tagName!=='IMG') return;
+    if(!/^data:/i.test(data.attrValue||'')) return;
+    if(!(typeof _isSafeDataImageUri==='function'&&_isSafeDataImageUri(data.attrValue))) data.keepAttr=false;
+  });
+  _markedDomPurifyHooksInstalled=true;
+}
+function _markedDomPurifyConfig(){
+  return {
+    ALLOWED_TAGS:['strong','em','del','code','pre','h1','h2','h3','h4','h5','h6','ul','ol','li','table','thead','tbody','tr','th','td','hr','blockquote','p','br','a','div','span','img','input'],
+    ALLOWED_ATTR:['href','title','target','rel','class','src','alt','loading','align','id','type','checked','disabled','data-mermaid-id','data-lang','data-raw'],
+    // Extends DOMPurify's own default scheme allowlist (which already covers
+    // https/http/mailto/tel/relative-and-fragment URLs and rejects
+    // javascript:/vbscript:/bare data:) with the one additional scheme
+    // renderMd() allows: message: (used for compose-message links).
+    // workspace://, session://, file:// never reach DOMPurify at all — the
+    // link renderer below rewrites them to safe relative/hash forms first.
+    ALLOWED_URI_REGEXP:/^(?:(?:(?:f|ht)tps?|mailto|tel|message|callto|sms|cid|xmpp|matrix):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$))/i,
+  };
+}
+function _getMarkedInstance(){
+  if(_markedInstance) return _markedInstance;
+  if(typeof marked==='undefined'||typeof marked.Marked!=='function') return null;
+  // breaks:true (GFM "breaks" extension, non-standard CommonMark but the
+  // conventional choice for chat UIs): renderMd()'s paragraph-wrap step
+  // turns every remaining single newline into <br> — plain CommonMark's
+  // soft-break-collapses-to-a-space behavior (breaks:false) would visibly
+  // reflow the common case of LLM output that relies on single newlines for
+  // line breaks within a paragraph, which is a real regression, not a
+  // cosmetic one — verified against the real renderer with a manual
+  // Playwright harness before landing this.
+  const instance=new marked.Marked({gfm:true, breaks:true});
+  instance.use({
+    renderer:{
+      code({text, lang}){
+        return _fencedCodeBlockHtml(lang||'', text);
+      },
+      link({href, title, tokens}){
+        const label=this.parser.parseInline(tokens);
+        const resolvedHref=_markdownHref(href);
+        const internal=/^session:\/\//i.test(String(href||''))||_isInternalSessionHref(resolvedHref);
+        const titleAttr=title?` title="${esc(title)}"`:'';
+        return `<a${internal?' class="session-link"':''} href="${esc(resolvedHref)}"${titleAttr}${internal?'':' target="_blank" rel="noopener"'}>${label}</a>`;
+      },
+      image({href, title, text}){
+        const resolvedHref=_markdownHref(href);
+        const titleAttr=title?` title="${esc(title)}"`:'';
+        return `<img class="msg-media-img" src="${esc(resolvedHref)}" alt="${esc(text||'')}"${titleAttr} loading="lazy">`;
+      },
+    },
+  });
+  _markedInstance=instance;
+  return _markedInstance;
+}
+// Protects $..$-style math delimiters from fenced-code-block content (a
+// shell script's `$HOME`/`$1` must never be mistaken for math) by only
+// scanning OUTSIDE backtick-fence regions, using the same fence-line
+// matchers renderMd()'s blockquote pre-pass uses. Plain-text placeholder
+// tokens (not renderMd()'s NUL-byte stash scheme — this is an independent
+// pipeline) survive marked's parsing and DOMPurify's sanitization unchanged
+// since they contain no markdown- or HTML-special characters.
+function _stashMathForMarked(text){
+  const stash=[];
+  const stashOne=(type, src)=>{
+    const token='KATEXSTASH'+stash.length+'ENDSTASH';
+    stash.push({type, src});
+    return token;
+  };
+  const stashChunk=chunk=>chunk
+    .replace(/\$\$([\s\S]+?)\$\$/g,(_,m)=>stashOne('display',m))
+    .replace(/\\\[([\s\S]+?)\\\]/g,(_,m)=>stashOne('display',m))
+    .replace(/\$([^\s$\d\n][^$\n]*?[^\s$\n]|[^\s\d])\$/g,(_,m)=>stashOne('inline',m))
+    .replace(/\\\((.+?)\\\)/g,(_,m)=>stashOne('inline',m));
+  const lines=String(text||'').split('\n');
+  const out=[];
+  let chunkLines=[];
+  let inFence=false, fenceLen=0;
+  const flushChunk=()=>{
+    if(!chunkLines.length) return;
+    out.push(stashChunk(chunkLines.join('\n')));
+    chunkLines=[];
+  };
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(inFence){
+      flushChunk();
+      out.push(line);
+      if(_isBacktickFenceClose(line,fenceLen)){inFence=false;fenceLen=0;}
+      continue;
+    }
+    const fenceOpen=_matchBacktickFenceLine(line);
+    if(fenceOpen){
+      flushChunk();
+      out.push(line);
+      inFence=true;
+      fenceLen=fenceOpen.len;
+      continue;
+    }
+    chunkLines.push(line);
+  }
+  flushChunk();
+  return {stashed:out.join('\n'), mathStash:stash};
+}
+function _restoreMathStash(html, mathStash){
+  if(!mathStash||!mathStash.length) return html;
+  let out=html;
+  for(let i=0;i<mathStash.length;i++){
+    const item=mathStash[i];
+    const token='KATEXSTASH'+i+'ENDSTASH';
+    const replacement=item.type==='display'
+      ? `<div class="katex-block" data-katex="display">${esc(item.src)}</div>`
+      : `<span class="katex-inline" data-katex="inline">${esc(item.src)}</span>`;
+    out=out.split(token).join(replacement);
+  }
+  // Display math on its own paragraph was stashed as opaque inline text, so
+  // marked wrapped it in <p>...</p> like any other paragraph — restoring the
+  // katex-block <div> above then left an (invalid, browser-auto-corrected)
+  // <div> nested inside a <p>. renderMd() avoids this entirely by excluding
+  // katex-block from its own paragraph-wrap step; unwrap the same cases here
+  // for the same DOM shape. Verified against the real renderer with a manual
+  // Playwright harness before landing this.
+  out=out.replace(/<p>\s*(<div class="katex-block"[^>]*>[\s\S]*?<\/div>)\s*<\/p>/g,'$1');
+  return out;
+}
+function renderMdViaMarked(raw){
+  const instance=_getMarkedInstance();
+  if(!instance||typeof DOMPurify==='undefined'||typeof DOMPurify.sanitize!=='function'){
+    // marked/DOMPurify not loaded yet (defer race right after boot) or
+    // unavailable for some other reason — fall back to the proven regex
+    // renderer rather than showing broken/raw markdown. renderMd() is not
+    // being removed by this change, so this fallback is always available.
+    return renderMd(raw);
+  }
+  _installMarkedDomPurifyHooks();
+  const {stashed, mathStash}=_stashMathForMarked(String(raw||''));
+  let html;
+  try{
+    html=instance.parse(stashed);
+  }catch(e){
+    return renderMd(raw);
+  }
+  const clean=DOMPurify.sanitize(html, _markedDomPurifyConfig());
+  return _restoreMathStash(clean, mathStash);
+}
+function _setUseMarkedRenderer(enabled){
+  if(typeof window==='undefined') return;
+  window._useMarkedRenderer=!!enabled;
+  // Old and new renderers produce different HTML for the same message, so
+  // any cached render under the previous renderer would be stale.
+  if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
+  if(typeof renderMessages==='function') renderMessages();
+}
+if(typeof window!=='undefined') window._setUseMarkedRenderer=_setUseMarkedRenderer;
 
 function _stripAttachedFilesMarkerForDisplay(text){
   return String(text||'').replace(/\n\n\[Attached files: [^\]]+\]$/,'').trim();
