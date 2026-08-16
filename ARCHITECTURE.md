@@ -574,6 +574,42 @@ Per-message render cache (`_renderCache`, ui.js ~1490-1560):
     markers, so re-running them against a cache-hit row is already a cheap
     no-op — no special-casing needed for cached rows there.
 
+Desktop content-visibility (style.css, ui.js ~1278-1554, ~16505-16515,
+~17064-17086):
+    content-visibility:auto already skips layout/paint for off-screen rows
+    on touch devices (@media (pointer: coarse)), but only for user rows —
+    assistant rows and all of desktop were excluded, per #4856/#5338/#5637/
+    #5638: a flat contain-intrinsic-size estimate on tall, unpredictable-
+    height off-screen assistant rows made scrollHeight lurch and the browser
+    force-clamp scrollTop, producing a visible jump.
+    Desktop (@media (hover: hover) and (pointer: fine)) now gets the same
+    treatment for USER rows unconditionally — same short/size-predictable
+    content, and the remembered-height backstop
+    (_rememberRenderedUserRowIntrinsicHeights/_applyUserRowIntrinsicHeight)
+    already ran on every render regardless of device; desktop just never
+    used it (content-visibility stayed 'visible' there, so
+    contain-intrinsic-size was ignored — "inert" per the code comment).
+    ASSISTANT turns on desktop are a separate, still-experimental piece:
+    gated behind a `cv-assistant-desktop` class on <html>, toggled only via
+    window._setDesktopAssistantContentVisibility(true) in the console —
+    default OFF, not wired to a persisted setting. Unlike user rows there is
+    no reliable text-length height estimate for a turn that may contain code
+    blocks, tool cards, and images, so the remembered-height backstop
+    (_rememberRenderedAssistantRowIntrinsicHeights/
+    _applyAssistantRowIntrinsicHeight — new, parallel to the user-row
+    versions, measuring the OUTER .msg-row.assistant-turn container rather
+    than an inner per-message element) can only floor at the flat
+    MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS.assistant estimate (160px), not a
+    per-row content estimate. The mobile history this mirrors found
+    content-visibility:auto can report a partial-paint height for a row
+    taller than the viewport rather than its true full height — a scenario
+    long assistant turns hit far more than short user rows. Needs dedicated
+    real-browser scroll-jump regression testing (modeled on
+    tests/test_issue4856_android_scroll_regression.py) before this flag is
+    considered safe to default on; tests/test_desktop_content_visibility.py
+    covers the JS mechanics (flag toggling, height memoization, CSS gating
+    structure) but not actual browser paint/scroll behavior.
+
 ### 5.5 Model Label Resolution (Fixed in Sprint 1, reused by composer selector)
 
 B3 was resolved in Sprint 1. Current code uses a MODEL_LABELS dict:

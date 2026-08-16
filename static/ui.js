@@ -600,6 +600,7 @@ function _clearMessageVirtualHeightCache(){
   _messageVirtualScrollSettleTimer=0;
   _messageVirtualDeferredMeasurement=null;
   if(typeof _clearUserRowIntrinsicHeightCache==='function') _clearUserRowIntrinsicHeightCache();
+  if(typeof _clearAssistantRowIntrinsicHeightCache==='function') _clearAssistantRowIntrinsicHeightCache();
 }
 function _resetMessageRenderWindow(sid){
   _messageRenderWindowSid=sid||null;
@@ -1451,6 +1452,112 @@ function _rememberRenderedUserRowIntrinsicHeights(){
     }
   }
 }
+// ── Desktop assistant-row content-visibility (experimental, flag-gated) ──
+// Extends the off-screen-row skip above to assistant turns on desktop. This
+// mirrors the user-row remembered-height pattern, but measures the OUTER
+// turn container (.msg-row.assistant-turn, dataset.role="assistant") rather
+// than an inner per-message element: a turn can hold several messages,
+// segments, and tool cards (see the assistant-turn-blocks loop in
+// renderMessages()), but the outer container is what CSS applies
+// content-visibility:auto to — same as user rows, both are top-level
+// .msg-row children of #msgInner — so its own getBoundingClientRect()
+// already covers everything inside it. This intentionally does NOT touch
+// _measureMessageVirtualRow/_updateMessageVirtualMeasurements: those exist
+// to estimate row heights for the *virtualization window* (a different
+// concern, keyed to inner per-message elements) and are left untouched.
+//
+// Gated off by default: content-visibility:auto only activates for
+// assistant rows on desktop when <html> carries cv-assistant-desktop (see
+// _applyDesktopAssistantContentVisibilityFlag), which only happens when
+// window._desktopAssistantContentVisibility is explicitly set. Until then
+// this whole block is dead weight, exactly like the user-row functions are
+// dead weight on desktop today.
+//
+// KNOWN OPEN RISK — do not flip the flag on by default without real-browser
+// scroll testing: unlike user rows, there is no reliable text-length height
+// estimate for assistant turns (code blocks, tool cards, and images all
+// defeat it), so the floor below falls back to the same flat
+// MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS.assistant estimate the virtualization
+// window already uses (160px). The mobile history this mirrors (#5637/
+// #5638) found that content-visibility:auto can report a PARTIAL paint
+// height for a row taller than the viewport rather than its true full
+// height, which is exactly the scenario a long assistant turn hits
+// constantly. A 160px floor does not fully protect against that on a
+// multi-thousand-px turn the way the user-row content-length estimate
+// protects short rows. Needs dedicated scroll-jump regression coverage
+// (modeled on tests/test_issue4856_android_scroll_regression.py) run
+// against a real browser before this is considered safe to default on.
+const _assistantRowIntrinsicHeightBySessionIdx=Object.create(null);
+function _clearAssistantRowIntrinsicHeightCache(){
+  for(const k in _assistantRowIntrinsicHeightBySessionIdx) delete _assistantRowIntrinsicHeightBySessionIdx[k];
+}
+function _rememberAssistantRowIntrinsicHeight(sessionMsgIdx, height){
+  const key=Number(sessionMsgIdx);
+  if(!Number.isFinite(key)||!(height>0)) return;
+  _assistantRowIntrinsicHeightBySessionIdx[key]=Math.round(height);
+}
+function _applyAssistantRowIntrinsicHeight(row, sessionMsgIdx){
+  if(!row||!row.style) return;
+  const key=Number(sessionMsgIdx);
+  const remembered=Number.isFinite(key)?Number(_assistantRowIntrinsicHeightBySessionIdx[key])||0:0;
+  const h=Math.max(remembered, MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS.assistant);
+  if(h>0) row.style.containIntrinsicSize='auto '+Math.round(h)+'px';
+}
+function _rememberRenderedAssistantRowIntrinsicHeights(){
+  const container=$('messages');
+  const inner=$('msgInner');
+  if(!container||!inner) return;
+  const rows=inner.querySelectorAll('.msg-row.assistant-turn[data-session-msg-idx]');
+  if(!rows.length) return;
+  const cRect=container.getBoundingClientRect();
+  const margin=Math.max(0, cRect.height||0);
+  for(let i=0;i<rows.length;i++){
+    const row=rows[i];
+    if(!row||!row.dataset||!row.style) continue;
+    // Never persist the height of the live streaming turn — it is still
+    // growing, and freezing a mid-stream height would under-reserve once it
+    // settles (same reasoning as the #liveAssistantTurn CSS opt-out).
+    if(row.id==='liveAssistantTurn') continue;
+    const r=row.getBoundingClientRect();
+    const measured=Math.max(0, r.height||0);
+    if(!(measured>0)) continue;
+    const inView=(r.bottom>=cRect.top-margin)&&(r.top<=cRect.bottom+margin);
+    if(!inView) continue;
+    const key=Number(row.dataset.sessionMsgIdx);
+    const remembered=Number.isFinite(key)?Number(_assistantRowIntrinsicHeightBySessionIdx[key])||0:0;
+    // Floor at the role-default estimate for the same reason
+    // _applyAssistantRowIntrinsicHeight does — see the KNOWN OPEN RISK note
+    // above about partial-paint under-measurement on very tall turns.
+    const h=Math.max(measured, MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS.assistant);
+    if(h>=remembered){
+      _rememberAssistantRowIntrinsicHeight(row.dataset.sessionMsgIdx, h);
+      row.style.containIntrinsicSize='auto '+Math.round(h)+'px';
+    }
+  }
+}
+// Reflects the (default-off) desktop assistant-row content-visibility flag
+// onto <html> so the CSS in style.css can gate on it — media queries can't
+// read arbitrary JS globals directly. Checked once at boot and re-applied by
+// the setter below so it can be toggled at runtime (devtools console) for
+// evaluation without a reload. Deliberately NOT wired to a persisted
+// setting yet: this is an evaluation flag for the desktop content-
+// visibility rollout, not a shipped user-facing preference (see the KNOWN
+// OPEN RISK note above _assistantRowIntrinsicHeightBySessionIdx).
+function _applyDesktopAssistantContentVisibilityFlag(){
+  if(typeof document==='undefined'||!document.documentElement) return;
+  const enabled=!!(typeof window!=='undefined'&&window._desktopAssistantContentVisibility);
+  document.documentElement.classList.toggle('cv-assistant-desktop', enabled);
+}
+function _setDesktopAssistantContentVisibility(enabled){
+  if(typeof window==='undefined') return;
+  window._desktopAssistantContentVisibility=!!enabled;
+  _applyDesktopAssistantContentVisibilityFlag();
+}
+if(typeof window!=='undefined') window._setDesktopAssistantContentVisibility=_setDesktopAssistantContentVisibility;
+// Apply once at script-eval time (ui.js loads before boot.js runs its own
+// init, and document.documentElement always exists by the time a <script>
+// tag executes) — later toggles go through the setter above.
+_applyDesktopAssistantContentVisibilityFlag();
 function _scheduleMessageVirtualizedRender(force){
   const container=$('messages');
   const inner=$('msgInner');
@@ -16509,6 +16616,10 @@ function renderMessages(options){
   // measurement reliable — the old elements have painted, so their rect height is real even
   // off-screen; a post-render read of a fresh off-screen row returns its collapsed reserve.
   if(typeof _rememberRenderedUserRowIntrinsicHeights==='function') _rememberRenderedUserRowIntrinsicHeights();
+  // Experimental desktop counterpart (see _rememberRenderedAssistantRowIntrinsicHeights
+  // for why assistant turns need their own pass rather than reusing the user-row one).
+  // Inert unless the cv-assistant-desktop flag is enabled — see that function's header.
+  if(typeof _rememberRenderedAssistantRowIntrinsicHeights==='function') _rememberRenderedAssistantRowIntrinsicHeights();
   // The DOM wipe can briefly collapse #msgInner to zero height, causing the
   // browser to clamp #messages.scrollTop to 0 and emit a scroll event.  That
   // event is a render artifact, not user intent; if the scroll listener sees it
@@ -16971,6 +17082,12 @@ function renderMessages(options){
       currentAssistantTurn.dataset.role='assistant';
       if(S.session) currentAssistantTurn.dataset.sessionId=S.session.session_id;
       currentAssistantTurn.dataset.recycleKey=rawIdx;
+      // Experimental desktop content-visibility (see
+      // _rememberRenderedAssistantRowIntrinsicHeights): reserve an initial
+      // estimate now, refined by the pre-wipe measurement pass next render.
+      // Inert unless the cv-assistant-desktop flag is enabled.
+      currentAssistantTurn.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
+      if(typeof _applyAssistantRowIntrinsicHeight==='function') _applyAssistantRowIntrinsicHeight(currentAssistantTurn, currentAssistantTurn.dataset.sessionMsgIdx);
       inner.appendChild(currentAssistantTurn);
     }
     _setLatestAssistantTurnLandmark(currentAssistantTurn, !m._live&&rawIdx===latestRenderedAssistantRawIdx);

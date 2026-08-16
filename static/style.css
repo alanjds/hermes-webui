@@ -5959,6 +5959,37 @@ main.main > #mainPlugin{display:none;}
      WebKit and on Android it re-opens the #4856 / #5338 mobile jump-to-top
      regression the scroll-anchor work fought hard to close. */
 }
+/* Desktop mirror of the touch-device rule above. Desktop's scroll model is
+   already the JS-driven anchor system (_captureMessageViewportAnchor/
+   _restoreMessageViewportAnchor in ui.js) rather than native overflow-anchor
+   — see .messages{overflow-anchor:none} under this same media condition
+   below — so this is a different failure mode than the mobile history the
+   touch rule above cites, not a proven-safe copy of it.
+
+   User rows ship unconditionally: same short/size-predictable content, same
+   remembered-height backstop (_rememberRenderedUserRowIntrinsicHeights /
+   _applyUserRowIntrinsicHeight in ui.js), and until this rule existed that
+   machinery was documented dead weight on desktop ("Desktop rests at
+   content-visibility:visible ... inert there").
+
+   Assistant turns stay behind the cv-assistant-desktop flag (default off,
+   see _applyDesktopAssistantContentVisibilityFlag / _setDesktopAssistant
+   ContentVisibility in ui.js) — unlike user rows there is no reliable
+   height estimate for a turn that may contain code blocks, tool cards, and
+   images, and the mobile history this mirrors (#5637/#5638) found
+   content-visibility:auto can report a partial-paint height for a row
+   taller than the viewport. Needs real-browser scroll-jump regression
+   coverage before defaulting on — see the KNOWN OPEN RISK comment above
+   _assistantRowIntrinsicHeightBySessionIdx in ui.js. */
+@media (hover: hover) and (pointer: fine) {
+  .msg-row[data-role="user"] { content-visibility: auto; contain-intrinsic-size: auto 96px; contain: layout style; }
+  html.cv-assistant-desktop .msg-row.assistant-turn { content-visibility: auto; contain-intrinsic-size: auto 160px; contain: layout style; }
+  .msg-row { contain: layout style; }
+  #liveAssistantTurn,
+  .msg-row[data-live-assistant-turn],
+  .msg-row[data-live-assistant],
+  .assistant-segment[data-live-assistant] { content-visibility: visible; }
+}
 .msg-body { padding-left: var(--msg-rail); padding-top: 8px; max-width: var(--msg-max); }
 .msg-body code,
 .msg-body pre,
