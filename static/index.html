@@ -1200,6 +1200,20 @@
               <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_virtualize_transcript">Experimental. Renders only the visible portion of very long chat transcripts (over 80 messages) to speed up scrolling. Off by default because it can cause scroll flicker on long sessions with large tool-call blocks. Turn it on to try it; leave it off for the full transcript to render at once (and so the browser's Find (Ctrl+F) matches the whole conversation).</div>
             </div>
             <div class="settings-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="settingsDesktopAssistantContentVisibility" style="width:15px;height:15px;accent-color:var(--accent)">
+                <span data-i18n="settings_label_desktop_assistant_content_visibility">Skip off-screen assistant rendering on desktop (experimental)</span>
+              </label>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_desktop_assistant_content_visibility">Experimental. Skips layout/paint for assistant replies scrolled off-screen on desktop, the same way it already works for your own messages. Off by default: unlike short messages, a long assistant reply's height can't always be estimated accurately ahead of time, which can occasionally cause a brief scroll jump. Turn it on to try it on long conversations; turn it back off if you notice the transcript jumping while you scroll.</div>
+            </div>
+            <div class="settings-field">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="settingsUseMarkedRenderer" style="width:15px;height:15px;accent-color:var(--accent)">
+                <span data-i18n="settings_label_use_marked_renderer">Use the new markdown renderer (experimental)</span>
+              </label>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px" data-i18n="settings_desc_use_marked_renderer">Experimental. Switches message rendering to marked.js + DOMPurify instead of the built-in renderer. Improves nested lists and adds real checkboxes for task lists, but has not been broadly tested yet — off by default. Turn it on to try it; turn it back off if anything looks wrong.</div>
+            </div>
+            <div class="settings-field">
               <label for="settingsSendKey" data-i18n="settings_label_send_key">Send Key</label>
               <select id="settingsSendKey" style="width:100%;padding:8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px">
                 <option value="enter">Enter (Shift+Enter for newline)</option>

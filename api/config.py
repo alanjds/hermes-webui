@@ -9330,6 +9330,8 @@ _SETTINGS_DEFAULTS = {
     "new_chat_on_workspace_switch": False,  # #5473 opt-in: switching to a DIFFERENT workspace starts a new chat (leaving the current conversation on its original workspace) instead of mutating the current session's workspace in place. Default OFF preserves the shipped in-place-switch behavior.
     "virtualize_transcript": False,  # #4343: virtualize long (>80 msg) transcripts. EXPERIMENTAL, opt-IN (default OFF). Was opt-out/default-on in #4325 but caused scroll-up flicker on long sessions with tall tool-call rows (variable-height anchor oscillation) — flipped off for everyone in #4343; re-enabling requires an explicit opt-in (see virtualize_transcript_optin migration in load_settings).
     "virtualize_transcript_optin": False,  # #4343 migration marker: True only once the user explicitly enables virtualize_transcript AFTER the default-off flip. A stored virtualize_transcript=True WITHOUT this marker is a stale pre-flip value and is reset to False on load (force-off-for-everyone migration).
+    "desktop_assistant_content_visibility": False,  # perf: content-visibility:auto for assistant rows on desktop. EXPERIMENTAL, opt-IN (default OFF) — unlike user rows, assistant-row height can't always be estimated accurately ahead of time, which can cause an occasional scroll jump (see ARCHITECTURE.md Section 5.4 "Desktop content-visibility").
+    "use_marked_renderer": False,  # perf/B8: marked.js + DOMPurify renderer instead of the hand-rolled renderMd() regex chain. EXPERIMENTAL, opt-IN (default OFF) — not yet broadly tested (see ARCHITECTURE.md Section 5.4 "marked.js + DOMPurify renderer").
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
     "show_cli_sessions": True,  # merge CLI/TUI/messaging sessions from state.db into the sidebar by default (#3988); established installs are grandfathered OFF by the load_settings backfill
@@ -9675,6 +9677,8 @@ _SETTINGS_BOOL_KEYS = {
     "new_chat_on_workspace_switch",
     "virtualize_transcript",
     "virtualize_transcript_optin",
+    "desktop_assistant_content_visibility",
+    "use_marked_renderer",
     "show_tps",
     "fade_text_effect",
     "show_cli_sessions",

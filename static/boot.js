@@ -3294,6 +3294,20 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     // but virtualization remains opt-in until battle-tested further.
     // Users can explicitly enable it via Settings → virtualize_transcript.
     window._virtualizeTranscript=s.virtualize_transcript===true;
+    // Perf: content-visibility:auto for assistant rows on desktop. EXPERIMENTAL,
+    // opt-IN (default OFF) — see ARCHITECTURE.md Section 5.4 "Desktop
+    // content-visibility" for why assistant-row height estimation is riskier
+    // than for user rows. Re-applies the flag ui.js already initialized to OFF
+    // at script-eval time (before settings were known) now that the real
+    // persisted value is available.
+    window._desktopAssistantContentVisibility=s.desktop_assistant_content_visibility===true;
+    if(typeof _applyDesktopAssistantContentVisibilityFlag==='function') _applyDesktopAssistantContentVisibilityFlag();
+    // marked.js + DOMPurify renderer (bug B8). EXPERIMENTAL, opt-IN (default
+    // OFF) — see ARCHITECTURE.md Section 5.4 "marked.js + DOMPurify renderer".
+    // Direct assignment only (no clearMessageRenderCache()/renderMessages()):
+    // nothing has rendered yet at boot, so _setUseMarkedRenderer()'s hot-apply
+    // side effects would be redundant here, same as render_user_markdown below.
+    window._useMarkedRenderer=s.use_marked_renderer===true;
     window._showTps=!!s.show_tps;
     window._fadeTextEffect=!!s.fade_text_effect;
     window._showCliSessions=s.show_cli_sessions!==false;
@@ -3452,6 +3466,9 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._hideEmptyStatePanel=false;
     applyEmptyStatePanelPref();
     window._virtualizeTranscript=false;  // settings-load failed: default-OFF (experimental/opt-in) (#4343)
+    window._desktopAssistantContentVisibility=false;  // settings-load failed: default-OFF (experimental/opt-in)
+    if(typeof _applyDesktopAssistantContentVisibilityFlag==='function') _applyDesktopAssistantContentVisibilityFlag();
+    window._useMarkedRenderer=false;  // settings-load failed: default-OFF (experimental/opt-in)
     window._showTps=false;
     window._fadeTextEffect=false;
     window._showCliSessions=true;  // settings-load failed: mirror the True config default (#3988)

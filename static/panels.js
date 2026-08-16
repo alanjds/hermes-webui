@@ -8727,6 +8727,10 @@ function _preferencesPayloadFromUi(){
     // and reset to off). Unchecking clears the marker.
     payload.virtualize_transcript_optin=virtualizeTranscriptCb.checked;
   }
+  const desktopAssistantCvCb=$('settingsDesktopAssistantContentVisibility');
+  if(desktopAssistantCvCb) payload.desktop_assistant_content_visibility=desktopAssistantCvCb.checked;
+  const useMarkedRendererCb=$('settingsUseMarkedRenderer');
+  if(useMarkedRendererCb) payload.use_marked_renderer=useMarkedRendererCb.checked;
   const showTpsCb=$('settingsShowTps');
   if(showTpsCb) payload.show_tps=showTpsCb.checked;
   const fadeTextCb=$('settingsFadeTextEffect');
@@ -9398,6 +9402,36 @@ async function loadSettingsPanel(){
         // Re-render the open transcript so the change takes effect immediately
         // (full render when off, windowed when on).
         if(typeof renderMessages==='function'){ try{ renderMessages({preserveScroll:true}); }catch(e){ console.warn('[virtualize_transcript] renderMessages failed on toggle:',e); } }
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
+    const desktopAssistantCvCb=$('settingsDesktopAssistantContentVisibility');
+    if(desktopAssistantCvCb){
+      // Experimental/opt-in, default OFF (ARCHITECTURE.md Section 5.4 "Desktop
+      // content-visibility" — assistant-row height estimation is less reliable
+      // than for short user rows, see the KNOWN OPEN RISK note in ui.js above
+      // _assistantRowIntrinsicHeightBySessionIdx). _setDesktopAssistantContent
+      // Visibility() both stores the flag and reflects it onto <html> for the
+      // style.css media rule to gate on.
+      desktopAssistantCvCb.checked=settings.desktop_assistant_content_visibility===true;
+      if(typeof _setDesktopAssistantContentVisibility==='function') _setDesktopAssistantContentVisibility(desktopAssistantCvCb.checked);
+      desktopAssistantCvCb.addEventListener('change',()=>{
+        if(typeof _setDesktopAssistantContentVisibility==='function') _setDesktopAssistantContentVisibility(desktopAssistantCvCb.checked);
+        _schedulePreferencesAutosave();
+      },{once:false});
+    }
+    const useMarkedRendererCb=$('settingsUseMarkedRenderer');
+    if(useMarkedRendererCb){
+      // Experimental/opt-in, default OFF (ARCHITECTURE.md Section 5.4 "marked.js
+      // + DOMPurify renderer" / bug B8). On load, just set the flag directly —
+      // same as render_user_markdown above — nothing has rendered yet, so the
+      // cache-clear+re-render _setUseMarkedRenderer() does on a user-driven
+      // toggle would be redundant here. The full setter is reserved for the
+      // change handler, where those side effects are actually wanted.
+      useMarkedRendererCb.checked=settings.use_marked_renderer===true;
+      window._useMarkedRenderer=useMarkedRendererCb.checked;
+      useMarkedRendererCb.addEventListener('change',()=>{
+        if(typeof _setUseMarkedRenderer==='function') _setUseMarkedRenderer(useMarkedRendererCb.checked);
         _schedulePreferencesAutosave();
       },{once:false});
     }

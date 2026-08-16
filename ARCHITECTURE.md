@@ -590,9 +590,13 @@ Desktop content-visibility (style.css, ui.js ~1278-1554, ~16505-16515,
     used it (content-visibility stayed 'visible' there, so
     contain-intrinsic-size was ignored — "inert" per the code comment).
     ASSISTANT turns on desktop are a separate, still-experimental piece:
-    gated behind a `cv-assistant-desktop` class on <html>, toggled only via
-    window._setDesktopAssistantContentVisibility(true) in the console —
-    default OFF, not wired to a persisted setting. Unlike user rows there is
+    gated behind a `cv-assistant-desktop` class on <html>, toggled via
+    window._setDesktopAssistantContentVisibility(true) — default OFF,
+    persisted server-side as the `desktop_assistant_content_visibility`
+    setting and exposed as an "(experimental)" Preferences-pane checkbox
+    (Settings → Preferences → "Skip off-screen assistant rendering on
+    desktop (experimental)"), same UX as the virtualize_transcript toggle.
+    Unlike user rows there is
     no reliable text-length height estimate for a turn that may contain code
     blocks, tool cards, and images, so the remembered-height backstop
     (_rememberRenderedAssistantRowIntrinsicHeights/
@@ -614,10 +618,15 @@ marked.js + DOMPurify renderer (Step 3a — B8, Phase E "remaining" item,
 ui.js `renderMdViaMarked()` and helpers just after renderMd()):
     A second, independent renderer alongside renderMd(), flag-gated via
     window._useMarkedRenderer (default OFF — toggle with
-    window._setUseMarkedRenderer(true) in the console for evaluation; not
-    yet wired to a persisted setting). _getCachedRender() dispatches to
-    whichever renderer the flag selects, and folds the flag into the cache
-    key so toggling never serves a stale render from the other renderer.
+    window._setUseMarkedRenderer(true), or via the "(experimental)"
+    Preferences-pane checkbox: Settings → Preferences → "Use the new
+    markdown renderer (experimental)"). Persisted server-side as the
+    `use_marked_renderer` setting, applied at boot and hot-applied when
+    toggled from the open Settings panel, same UX as virtualize_transcript
+    and desktop_assistant_content_visibility above. _getCachedRender()
+    dispatches to whichever renderer the flag selects, and folds the flag
+    into the cache key so toggling never serves a stale render from the
+    other renderer.
     marked and DOMPurify load from jsdelivr with SRI (index.html), same
     eager+defer+integrity pattern as Prism — see tests/vendor/README.md for
     the exact pinned versions (marked 18.0.9, DOMPurify 3.4.13) and where
