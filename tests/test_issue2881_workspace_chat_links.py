@@ -42,6 +42,11 @@ function extractFunc(name) {
 }
 eval(extractFunc('_matchBacktickFenceLine'));
 eval(extractFunc('_isBacktickFenceClose'));
+eval(extractFunc('_safeAttrValue'));
+eval(extractFunc('_markdownHref'));
+eval(extractFunc('_isInternalSessionHref'));
+eval(extractFunc('_isSafeUrl'));
+eval(extractFunc('_fencedCodeBlockHtml'));
 eval(extractFunc('renderMd'));
 
 let buf = '';

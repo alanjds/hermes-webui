@@ -7496,6 +7496,133 @@ function _stripVisibleAssistantEchoFromThinking(thinkingText, ...visibleTexts){
   return clean;
 }
 
+// Shared fenced-code-block HTML builder. Extracted verbatim (no behavior
+// change) from renderMd()'s fence-processing regex callback so it can be
+// reused by renderMdViaMarked() (Step 3, the marked.js-based renderer) —
+// both renderers need the exact same mermaid/diff/json-yaml/csv special-
+// case handling, and duplicating it in two places would let them drift.
+// Returns the complete HTML string for one fenced code block; lang/code are
+// the raw, untrimmed regex capture groups (info string and body text).
+function _fencedCodeBlockHtml(rawLangInfo, rawCode){
+  const langInfo=(rawLangInfo||'').trim();
+  const langMatch=langInfo.match(/^(\w[\w+-]*)$/);
+  const lang=langMatch?(langMatch[1]||'').trim().toLowerCase():'';
+  const code=rawCode||'';
+  const codeLines=code.split('\n');
+  const firstCodeLine=codeLines.find(line=>line.trim())||'';
+  const firstMermaidLine=codeLines.map(line=>line.trim()).find(line=>line&&!line.startsWith('%%'))||'';
+  const looksLikeLineNumberedToolOutput=/^\s*\d+\|/.test(firstCodeLine);
+  const looksLikeMermaidStart=firstMermaidLine==='---'||/^(graph|flowchart|sequenceDiagram|classDiagram|classDiagram-v2|stateDiagram|stateDiagram-v2|erDiagram|journey|gantt|pie|gitGraph|mindmap|timeline|quadrantChart|requirementDiagram|C4Context|C4Container|C4Component|C4Dynamic|c4Context|c4Container|c4Component|c4Dynamic|sankey-beta|block-beta|packet-beta|xychart-beta|kanban|architecture-beta)\b/.test(firstMermaidLine);
+  if(lang==='mermaid'&&!looksLikeLineNumberedToolOutput&&looksLikeMermaidStart){
+    const id='mermaid-'+Math.random().toString(36).slice(2,10);
+    return `<div class="mermaid-block" data-mermaid-id="${id}">${esc(code.trim())}</div>`;
+  }
+  const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
+  const langAttr=lang?` class="language-${esc(lang)}"`:'';
+  const preClass=/^(md|markdown|mdx)$/.test(lang)?' class="md-source-block"':'';
+  // For diff/patch blocks, wrap each line in a colored span
+  if(lang==='diff'||lang==='patch'){
+    const colored=esc(code.replace(/\n$/,'')).split('\n').map(line=>{
+      if(line.startsWith('@@')) return `<span class="diff-line diff-hunk">${line}</span>`;
+      if(line.startsWith('+')) return `<span class="diff-line diff-plus">${line}</span>`;
+      if(line.startsWith('-')) return `<span class="diff-line diff-minus">${line}</span>`;
+      return `<span class="diff-line">${line}</span>`;
+    }).join('\n');
+    return `${h}<pre class="diff-block"><code${langAttr}>${colored}</code></pre>`;
+  }
+  // For JSON/YAML blocks, add tree-view placeholder with raw data
+  if(lang==='json'||lang==='yaml'){
+    const rawCode=esc(code.replace(/\n$/,''));
+    // Encode newlines as &#10; to prevent HTML attribute normalization
+    // (browsers collapse \n to spaces inside attribute values).
+    const rawAttr=rawCode.replace(/"/g,'&quot;').replace(/\n/g,'&#10;');
+    const blockId='tree-'+Math.random().toString(36).slice(2,10);
+    return `<div class="code-tree-wrap" data-raw="${rawAttr}" data-lang="${lang}" id="${blockId}">${h}<pre class="tree-raw-view"><code${langAttr}>${rawCode}</code></pre></div>`;
+  }
+  // CSV blocks → render as styled table
+  if(lang==='csv'){
+    const rows=code.replace(/\n$/,'').split('\n').filter(r=>r.trim());
+    if(rows.length>=2){
+      const headers=rows[0].split(',').map(c=>c.trim());
+      const body=rows.slice(1).map(r=>'<tr>'+r.split(',').map(c=>`<td>${esc(c.trim())}</td>`).join('')+'</tr>').join('');
+      return `${h}<div class="csv-table-wrap"><table class="csv-table"><thead><tr>${headers.map(hh=>`<th>${esc(hh)}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table></div>`;
+    }
+    return `${h}<pre${preClass}><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`;
+  }
+  return `${h}<pre${preClass}><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`;
+}
+// Shared link/URL helpers. Extracted verbatim (no behavior change) from
+// inside renderMd() so renderMdViaMarked() (Step 3, the marked.js-based
+// renderer) can reuse the exact same workspace://\session://\file:// href
+// rewriting and URL-scheme safety check — both renderers must agree on what
+// counts as a safe link, and duplicating the logic in two places would let
+// them drift. Hoisted function declarations remain visible to renderMd()'s
+// existing call sites below without any change there.
+function _safeAttrValue(v){
+  return String(v||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&').trim();
+}
+function _markdownHref(raw){
+  const href=String(raw||'').replace(/"/g,'%22');
+  if(/^session:\/\//i.test(href)){
+    const sid=href.replace(/^session:\/\//i,'').split(/[?#]/)[0];
+    try{
+      const decoded=decodeURIComponent(sid);
+      if(typeof _sessionUrlForSid==='function') return _sessionUrlForSid(decoded);
+      return 'session/'+encodeURIComponent(decoded);
+    }catch(_){
+      return 'session/'+encodeURIComponent(sid);
+    }
+  }
+  if(/^workspace:\/\//i.test(href)){
+    try{
+      const rel=decodeURIComponent(href.replace(/^workspace:\/\//i,'')).replace(/^~\//,'').replace(/^\.\//,'');
+      return '#workspace='+encodeURIComponent(rel);
+    }catch(_){
+      return '#';
+    }
+  }
+  if(/^file:\/\//i.test(href)){
+    try{
+      const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
+      return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
+    }catch(_){
+      return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
+    }
+  }
+  return href;
+}
+function _isInternalSessionHref(raw){
+  const href=String(raw||'').trim();
+  if(/^session\/[^?#]+/i.test(href)) return true;
+  try{
+    const base=(typeof document!=='undefined'&&document.baseURI)||
+      (typeof window!=='undefined'&&window.location&&window.location.href)||
+      'http://localhost/';
+    const url=new URL(href,base);
+    const baseUrl=new URL(base,base);
+    if(url.origin!==baseUrl.origin) return false;
+    const basePath=baseUrl.pathname.replace(/(?:index\.html)?$/,'').replace(/\/[^/]*$/,'/');
+    const root=basePath.endsWith('/')?basePath:basePath+'/';
+    return url.pathname.startsWith(root+'session/')||url.pathname.startsWith('/session/');
+  }catch(_){
+    return false;
+  }
+}
+function _isSafeUrl(v, img){
+  const raw=_safeAttrValue(v);
+  const compact=raw.replace(/[\u0000-\u001f\u007f\s]+/g,'').toLowerCase();
+  if(!compact) return false;
+  // data:image/* is permitted for <img> only, validated by the shared strict
+  // predicate. Every other
+  // data: scheme stays blocked for both anchors and images.
+  if(/^data:/i.test(compact)) return !!(img && typeof _isSafeDataImageUri==='function' && _isSafeDataImageUri(raw));
+  if(/^(javascript|vbscript):/i.test(compact)) return false;
+  if(/^https?:\/\//i.test(raw)) return true;
+  if(/^(mailto:|tel:|message:)/i.test(raw)) return true;
+  if(img && /^api\//i.test(raw)) return true;
+  if(!img && (/^api\//i.test(raw) || /^#/.test(raw) || _isInternalSessionHref(raw))) return true;
+  return false;
+}
 function renderMd(raw){
   let s=(raw||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
   // ── Entity decode: must run FIRST so &gt; lines become > for the blockquote
@@ -7600,53 +7727,7 @@ function renderMd(raw){
   // block at the wrong place, leaking content into the markdown stream where
   // bold/italic/inline-code passes corrupt it. Fixes #1438 and #1696.
   s=s.replace(/(^|\n)[ ]{0,3}(`{3,})([^\n`]*)\n(?:([\s\S]*?)\n)?[ ]{0,3}\2`*[ \t]*(?=\n|$)/g,(_,lead,_fence,info,code)=>{
-    const langInfo=(info||'').trim();
-    const langMatch=langInfo.match(/^(\w[\w+-]*)$/);
-    const lang=langMatch?(langMatch[1]||'').trim().toLowerCase():'';
-    code=code||'';
-    const codeLines=code.split('\n');
-    const firstCodeLine=codeLines.find(line=>line.trim())||'';
-    const firstMermaidLine=codeLines.map(line=>line.trim()).find(line=>line&&!line.startsWith('%%'))||'';
-    const looksLikeLineNumberedToolOutput=/^\s*\d+\|/.test(firstCodeLine);
-    const looksLikeMermaidStart=firstMermaidLine==='---'||/^(graph|flowchart|sequenceDiagram|classDiagram|classDiagram-v2|stateDiagram|stateDiagram-v2|erDiagram|journey|gantt|pie|gitGraph|mindmap|timeline|quadrantChart|requirementDiagram|C4Context|C4Container|C4Component|C4Dynamic|c4Context|c4Container|c4Component|c4Dynamic|sankey-beta|block-beta|packet-beta|xychart-beta|kanban|architecture-beta)\b/.test(firstMermaidLine);
-    if(lang==='mermaid'&&!looksLikeLineNumberedToolOutput&&looksLikeMermaidStart){
-      const id='mermaid-'+Math.random().toString(36).slice(2,10);
-      _preBlock_stash.push(`<div class="mermaid-block" data-mermaid-id="${id}">${esc(code.trim())}</div>`);
-    } else {
-      const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
-      const langAttr=lang?` class="language-${esc(lang)}"`:'';
-      const preClass=/^(md|markdown|mdx)$/.test(lang)?' class="md-source-block"':'';
-      // For diff/patch blocks, wrap each line in a colored span
-      if(lang==='diff'||lang==='patch'){
-        const colored=esc(code.replace(/\n$/,'')).split('\n').map(line=>{
-          if(line.startsWith('@@')) return `<span class="diff-line diff-hunk">${line}</span>`;
-          if(line.startsWith('+')) return `<span class="diff-line diff-plus">${line}</span>`;
-          if(line.startsWith('-')) return `<span class="diff-line diff-minus">${line}</span>`;
-          return `<span class="diff-line">${line}</span>`;
-        }).join('\n');
-        _preBlock_stash.push(`${h}<pre class="diff-block"><code${langAttr}>${colored}</code></pre>`);
-      // For JSON/YAML blocks, add tree-view placeholder with raw data
-      } else if(lang==='json'||lang==='yaml'){
-        const rawCode=esc(code.replace(/\n$/,''));
-        // Encode newlines as &#10; to prevent HTML attribute normalization
-        // (browsers collapse \n to spaces inside attribute values).
-        const rawAttr=rawCode.replace(/"/g,'&quot;').replace(/\n/g,'&#10;');
-        const blockId='tree-'+Math.random().toString(36).slice(2,10);
-        _preBlock_stash.push(`<div class="code-tree-wrap" data-raw="${rawAttr}" data-lang="${lang}" id="${blockId}">${h}<pre class="tree-raw-view"><code${langAttr}>${rawCode}</code></pre></div>`);
-      // CSV blocks → render as styled table
-      } else if(lang==='csv'){
-        const rows=code.replace(/\n$/,'').split('\n').filter(r=>r.trim());
-        if(rows.length>=2){
-          const headers=rows[0].split(',').map(c=>c.trim());
-          const body=rows.slice(1).map(r=>'<tr>'+r.split(',').map(c=>`<td>${esc(c.trim())}</td>`).join('')+'</tr>').join('');
-          _preBlock_stash.push(`${h}<div class="csv-table-wrap"><table class="csv-table"><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table></div>`);
-        } else {
-          _preBlock_stash.push(`${h}<pre${preClass}><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
-        }
-      } else {
-        _preBlock_stash.push(`${h}<pre${preClass}><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
-      }
-    }
+    _preBlock_stash.push(_fencedCodeBlockHtml(info, code));
     return lead+'\x00P'+(_preBlock_stash.length-1)+'\x00';
   });
   s=s.replace(/`([^`\n]+)`/g,(_,c)=>{fence_stash.push('<code>'+esc(c)+'</code>');return '\x00F'+(fence_stash.length-1)+'\x00';});
@@ -7892,56 +7973,6 @@ function renderMd(raw){
   // Reference only — documents the allowed tag set. Superseded by _tag() allowlists.
   // Tests verify this list is complete; _tag() enforces it.
   const SAFE_TAGS=/^<\/?(?:strong|em|del|code|pre|h[1-6]|ul|ol|li|table|thead|tbody|tr|th|td|hr|blockquote|p|br|a|div|span|img)([\s>]|$)/i;
-  function _safeAttrValue(v){
-    return String(v||'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&').trim();
-  }
-  function _markdownHref(raw){
-    const href=String(raw||'').replace(/"/g,'%22');
-    if(/^session:\/\//i.test(href)){
-      const sid=href.replace(/^session:\/\//i,'').split(/[?#]/)[0];
-      try{
-        const decoded=decodeURIComponent(sid);
-        if(typeof _sessionUrlForSid==='function') return _sessionUrlForSid(decoded);
-        return 'session/'+encodeURIComponent(decoded);
-      }catch(_){
-        return 'session/'+encodeURIComponent(sid);
-      }
-    }
-    if(/^workspace:\/\//i.test(href)){
-      try{
-        const rel=decodeURIComponent(href.replace(/^workspace:\/\//i,'')).replace(/^~\//,'').replace(/^\.\//,'');
-        return '#workspace='+encodeURIComponent(rel);
-      }catch(_){
-        return '#';
-      }
-    }
-    if(/^file:\/\//i.test(href)){
-      try{
-        const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
-        return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
-      }catch(_){
-        return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
-      }
-    }
-    return href;
-  }
-  function _isInternalSessionHref(raw){
-    const href=String(raw||'').trim();
-    if(/^session\/[^?#]+/i.test(href)) return true;
-    try{
-      const base=(typeof document!=='undefined'&&document.baseURI)||
-        (typeof window!=='undefined'&&window.location&&window.location.href)||
-        'http://localhost/';
-      const url=new URL(href,base);
-      const baseUrl=new URL(base,base);
-      if(url.origin!==baseUrl.origin) return false;
-      const basePath=baseUrl.pathname.replace(/(?:index\.html)?$/,'').replace(/\/[^/]*$/,'/');
-      const root=basePath.endsWith('/')?basePath:basePath+'/';
-      return url.pathname.startsWith(root+'session/')||url.pathname.startsWith('/session/');
-    }catch(_){
-      return false;
-    }
-  }
   function _isSafeLabelInline(tag){
     return /^<\/?(strong|em|del|code)([\s>]|$)/i.test(tag);
   }
@@ -7958,21 +7989,6 @@ function renderMd(raw){
     const href=_markdownHref(rawUrl);
     const internal=/^session:\/\//i.test(String(rawUrl||'')) || _isInternalSessionHref(href);
     return `<a${internal?' class="session-link"':''} href="${href}"${internal?'':' target="_blank" rel="noopener"'}>${_markdownLabelHtml(label)}</a>`;
-  }
-  function _isSafeUrl(v, img){
-    const raw=_safeAttrValue(v);
-    const compact=raw.replace(/[\u0000-\u001f\u007f\s]+/g,'').toLowerCase();
-    if(!compact) return false;
-    // data:image/* is permitted for <img> only, validated by the shared strict
-    // predicate. Every other
-    // data: scheme stays blocked for both anchors and images.
-    if(/^data:/i.test(compact)) return !!(img && typeof _isSafeDataImageUri==='function' && _isSafeDataImageUri(raw));
-    if(/^(javascript|vbscript):/i.test(compact)) return false;
-    if(/^https?:\/\//i.test(raw)) return true;
-    if(/^(mailto:|tel:|message:)/i.test(raw)) return true;
-    if(img && /^api\//i.test(raw)) return true;
-    if(!img && (/^api\//i.test(raw) || /^#/.test(raw) || _isInternalSessionHref(raw))) return true;
-    return false;
   }
   function _attrs(raw){
     const out={};
