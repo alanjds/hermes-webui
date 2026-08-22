@@ -18226,6 +18226,24 @@ function renderMessages(options){
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
   }
+  // Record the window this render actually painted. _scheduleMessageVirtualizedRender()
+  // dedupes on this key ("the window hasn't moved, nothing to re-render"), and the
+  // scroll listener calls it on EVERY scroll event — including the scrollTop write
+  // _compensateScrollForMeasurementDelta() makes right after a re-render.
+  //
+  // Only the cached-HTML early-return branch above set this. That branch is gated on
+  // `sid !== _sessionHtmlCacheSid`, i.e. it only runs when switching TO a session, so
+  // every steady-state re-render of the CURRENT session left the key at '' — the guard
+  // could never match, and the compensation's own scroll write scheduled yet another
+  // full re-render. That closed a self-sustaining loop: render -> compensate (writes
+  // scrollTop) -> scroll event -> schedule -> render, forever, measured at ~10 renders
+  // per second on an idle 2000-message transcript with virtualization on, each one
+  // re-running the scroll-restore path. That is the #4343 "unusable when enabled".
+  //
+  // Set it on the normal path too, so a scroll event that does not actually move the
+  // virtual window is a no-op. Assigned AFTER the render (not at the top) so an early
+  // return above cannot claim a window it never painted.
+  _messageVirtualWindowKey=renderWindowKey;
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
   // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
   // not synchronously: inside this render sync stack the browser still reports a transient

@@ -404,6 +404,60 @@ console.log(JSON.stringify({blank, visible}));
     assert metrics["visible"] is True
 
 
+def test_render_messages_records_window_key_on_the_normal_path():
+    """#4343: a virtualized render must record the window it painted, on EVERY path.
+
+    _scheduleMessageVirtualizedRender() dedupes on _messageVirtualWindowKey ("the
+    window hasn't moved, don't re-render"), and the scroll listener calls it on
+    every scroll event — including the scrollTop write that
+    _compensateScrollForMeasurementDelta() makes right after a re-render.
+
+    The key was only assigned inside the cached-HTML early-return branch, which is
+    gated on `sid !== _sessionHtmlCacheSid` and therefore only runs when switching
+    TO a session. Every steady-state re-render of the CURRENT session left the key
+    at '', so the dedupe could never match and the compensation's own scroll write
+    scheduled another full re-render: render -> compensate -> scroll -> schedule ->
+    render, forever (~10 renders/second on an idle 2000-message transcript).
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    start = js.index("function renderMessages(options){")
+    # brace-balance to the end of renderMessages
+    brace = js.index("{", start)
+    depth = 0
+    end = brace
+    for i in range(brace, len(js)):
+        if js[i] == "{":
+            depth += 1
+        elif js[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    body = js[start:end]
+
+    assert "const renderWindowKey=_messageVirtualWindowKeyFor(virtualWindow);" in body
+    assignments = body.count("_messageVirtualWindowKey=renderWindowKey;")
+    assert assignments >= 2, (
+        "renderMessages must record the painted window key on the normal render path, "
+        "not only inside the cached-HTML early return — otherwise every scroll event "
+        "re-renders the whole virtual window forever (#4343)"
+    )
+
+    # It must land AFTER the DOM is built (so an early return cannot claim a window
+    # it never painted) and BEFORE the measurement pass reads the same window.
+    cache_pos = body.index("_messageVirtualWindowKey=renderWindowKey;")
+    normal_pos = body.index("_messageVirtualWindowKey=renderWindowKey;", cache_pos + 1)
+    measure_pos = body.rindex("_updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);")
+    assert normal_pos < measure_pos, (
+        "the normal-path window-key assignment must precede the final "
+        "_updateMessageVirtualMeasurements call"
+    )
+    # And it must sit after the cache-population block, i.e. late in the function.
+    assert normal_pos > body.index("_sessionHtmlCacheSid=sid;"), (
+        "the normal-path assignment must come after the render completes, not at the top"
+    )
+
+
 def test_render_messages_has_one_shot_virtual_blank_viewport_fallback():
     js = UI_JS_PATH.read_text(encoding="utf-8")
     render_start = js.index("function renderMessages(options)")
