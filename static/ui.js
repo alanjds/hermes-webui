@@ -1483,6 +1483,12 @@ function _scheduleMessageVirtualizedRender(force){
       _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
     }
     finally{ _msgNodeRecycleEnabled=false; }
+    // Mirror the _scrollbarDragActive branch above: record the window this
+    // render settled on. renderMessages() also records it (see the assignment
+    // next to _updateMessageVirtualMeasurements), but doing it here too keeps
+    // the scheduler's own bookkeeping self-contained for the paths that reach
+    // renderMessages indirectly.
+    _messageVirtualWindowKey=liveKey;
   });
 }
 
@@ -6345,12 +6351,21 @@ if(typeof window!=='undefined'){
   },{capture:true,passive:true});
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
-    _scheduleMessageVirtualizedRender();
+    // The jump-to-answer owner (#6621) must keep the virtualized window
+    // following an in-flight smooth scroll regardless of the guard's freshness
+    // window, so it schedules unconditionally and returns before the guard.
     if(_messageJumpScrollOwner){
+      _scheduleMessageVirtualizedRender();
       _scheduleMessageJumpScrollReconcile(_messageJumpScrollOwner.generation);
       return;
     }
+    // Everything else: check the programmatic-scroll guard FIRST. A virtualized
+    // re-render's own _compensateScrollForMeasurementDelta() scrollTop write
+    // fires a scroll event; scheduling before the guard let that write re-enter
+    // the scheduler while still marked programmatic, which is one half of the
+    // #6799 feedback loop.
     if(_freshProgrammaticScrollActive()) return;
+    _scheduleMessageVirtualizedRender();
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
