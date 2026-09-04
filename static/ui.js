@@ -1483,6 +1483,12 @@ function _scheduleMessageVirtualizedRender(force){
       _compensateScrollForMeasurementDelta(()=>{ renderMessages({ preserveScroll:true }); });
     }
     finally{ _msgNodeRecycleEnabled=false; }
+    // Mirror the _scrollbarDragActive branch above: record the window this
+    // render settled on. renderMessages() also records it (see the assignment
+    // next to _updateMessageVirtualMeasurements), but doing it here too keeps
+    // the scheduler's own bookkeeping self-contained for the paths that reach
+    // renderMessages indirectly.
+    _messageVirtualWindowKey=liveKey;
   });
 }
 
@@ -6345,12 +6351,21 @@ if(typeof window!=='undefined'){
   },{capture:true,passive:true});
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
-    _scheduleMessageVirtualizedRender();
+    // The jump-to-answer owner (#6621) must keep the virtualized window
+    // following an in-flight smooth scroll regardless of the guard's freshness
+    // window, so it schedules unconditionally and returns before the guard.
     if(_messageJumpScrollOwner){
+      _scheduleMessageVirtualizedRender();
       _scheduleMessageJumpScrollReconcile(_messageJumpScrollOwner.generation);
       return;
     }
+    // Everything else: check the programmatic-scroll guard FIRST. A virtualized
+    // re-render's own _compensateScrollForMeasurementDelta() scrollTop write
+    // fires a scroll event; scheduling before the guard let that write re-enter
+    // the scheduler while still marked programmatic, which is one half of the
+    // #6799 feedback loop.
     if(_freshProgrammaticScrollActive()) return;
+    _scheduleMessageVirtualizedRender();
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
@@ -18188,6 +18203,24 @@ function renderMessages(options){
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
   }
+  // Record the window this render actually painted. _scheduleMessageVirtualizedRender()
+  // dedupes on this key ("the window hasn't moved, nothing to re-render"), and the
+  // scroll listener calls it on EVERY scroll event — including the scrollTop write
+  // _compensateScrollForMeasurementDelta() makes right after a re-render.
+  //
+  // Only the cached-HTML early-return branch above set this. That branch is gated on
+  // `sid !== _sessionHtmlCacheSid`, i.e. it only runs when switching TO a session, so
+  // every steady-state re-render of the CURRENT session left the key at '' — the guard
+  // could never match, and the compensation's own scroll write scheduled yet another
+  // full re-render. That closed a self-sustaining loop: render -> compensate (writes
+  // scrollTop) -> scroll event -> schedule -> render, forever, measured at ~10 renders
+  // per second on an idle 2000-message transcript with virtualization on, each one
+  // re-running the scroll-restore path. That is the #4343 "unusable when enabled".
+  //
+  // Set it on the normal path too, so a scroll event that does not actually move the
+  // virtual window is a no-op. Assigned AFTER the render (not at the top) so an early
+  // return above cannot claim a window it never painted.
+  _messageVirtualWindowKey=renderWindowKey;
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
   // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
   // not synchronously: inside this render sync stack the browser still reports a transient
