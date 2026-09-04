@@ -196,6 +196,9 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {
   default: 140,
 };
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+eval(extractFunc('_messageVirtualEstimatedHeightForRole'));
 eval(extractFunc('_messageVirtualRoleForEntry'));
 let virtualized = true;
 let _messageVirtualHeightCache = [0, 220, 180, 120];
@@ -401,6 +404,60 @@ console.log(JSON.stringify({blank, visible}));
     assert metrics["visible"] is True
 
 
+def test_render_messages_records_window_key_on_the_normal_path():
+    """#4343: a virtualized render must record the window it painted, on EVERY path.
+
+    _scheduleMessageVirtualizedRender() dedupes on _messageVirtualWindowKey ("the
+    window hasn't moved, don't re-render"), and the scroll listener calls it on
+    every scroll event — including the scrollTop write that
+    _compensateScrollForMeasurementDelta() makes right after a re-render.
+
+    The key was only assigned inside the cached-HTML early-return branch, which is
+    gated on `sid !== _sessionHtmlCacheSid` and therefore only runs when switching
+    TO a session. Every steady-state re-render of the CURRENT session left the key
+    at '', so the dedupe could never match and the compensation's own scroll write
+    scheduled another full re-render: render -> compensate -> scroll -> schedule ->
+    render, forever (~10 renders/second on an idle 2000-message transcript).
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    start = js.index("function renderMessages(options){")
+    # brace-balance to the end of renderMessages
+    brace = js.index("{", start)
+    depth = 0
+    end = brace
+    for i in range(brace, len(js)):
+        if js[i] == "{":
+            depth += 1
+        elif js[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    body = js[start:end]
+
+    assert "const renderWindowKey=_messageVirtualWindowKeyFor(virtualWindow);" in body
+    assignments = body.count("_messageVirtualWindowKey=renderWindowKey;")
+    assert assignments >= 2, (
+        "renderMessages must record the painted window key on the normal render path, "
+        "not only inside the cached-HTML early return — otherwise every scroll event "
+        "re-renders the whole virtual window forever (#4343)"
+    )
+
+    # It must land AFTER the DOM is built (so an early return cannot claim a window
+    # it never painted) and BEFORE the measurement pass reads the same window.
+    cache_pos = body.index("_messageVirtualWindowKey=renderWindowKey;")
+    normal_pos = body.index("_messageVirtualWindowKey=renderWindowKey;", cache_pos + 1)
+    measure_pos = body.rindex("_updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);")
+    assert normal_pos < measure_pos, (
+        "the normal-path window-key assignment must precede the final "
+        "_updateMessageVirtualMeasurements call"
+    )
+    # And it must sit after the cache-population block, i.e. late in the function.
+    assert normal_pos > body.index("_sessionHtmlCacheSid=sid;"), (
+        "the normal-path assignment must come after the render completes, not at the top"
+    )
+
+
 def test_render_messages_has_one_shot_virtual_blank_viewport_fallback():
     js = UI_JS_PATH.read_text(encoding="utf-8")
     render_start = js.index("function renderMessages(options)")
@@ -553,6 +610,11 @@ function _messageVirtualDefaultHeightForRole(role){
 }
 const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 80;
 const MESSAGE_VIRTUAL_BUFFER_PX = 900;
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+function _messageVirtualEstimatedHeightForRole(role){
+  return _messageVirtualDefaultHeightForRole(role);
+}
 let _messageVirtualHeightCache = [];
 let _messageVirtualEstimatedRowHeight = 140;
 function _syncMessageVirtualHeightCache(){ /* no-op for the test */ }
@@ -612,6 +674,9 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
   default:140,
 };
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+eval(extractFunc('_messageVirtualEstimatedHeightForRole'));
 console.log(JSON.stringify({
   tool_call: _messageVirtualDefaultHeightForRole('tool_call'),
   user: _messageVirtualDefaultHeightForRole('user'),
@@ -666,6 +731,9 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
 const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 80;
 const MESSAGE_VIRTUAL_BUFFER_PX = 900;
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+eval(extractFunc('_messageVirtualEstimatedHeightForRole'));
 eval(extractFunc('_messageVirtualWindow'));
 const visWithIdx = [
   {m: {role: 'user'}},
@@ -704,6 +772,60 @@ console.log(JSON.stringify({
     assert metrics["end"] - metrics["start"] > 0
 
 
+def test_unmeasured_rows_use_measured_role_mean_once_samples_exist():
+    """#4343 groundwork: an unmeasured row must contribute the role's MEASURED mean.
+
+    rowHeightFor() only consulted the static MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS
+    constant (roleForIdx is always supplied, so the measurement-derived
+    `defaultHeight` was dead code), leaving the virtual scroll geometry built from
+    a flat per-role guess for every row that never entered the render window — 34%
+    short of the real transcript height on a 2000-row session. This pins that a
+    role with enough samples now estimates from them, and that a role without
+    samples still falls back to its static seed (so first paint is unchanged).
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={user:120, assistant:160, tool_call:400, default:140};
+eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+eval(extractFunc('_resetMessageVirtualRoleHeightStats'));
+eval(extractFunc('_recordMessageVirtualRoleHeightSample'));
+eval(extractFunc('_messageVirtualEstimatedHeightForRole'));
+
+const seeded = _messageVirtualEstimatedHeightForRole('user');
+// Below the sample floor: still the static seed.
+_recordMessageVirtualRoleHeightSample('user', 300);
+_recordMessageVirtualRoleHeightSample('user', 300);
+const belowFloor = _messageVirtualEstimatedHeightForRole('user');
+// At the floor: the measured mean takes over.
+_recordMessageVirtualRoleHeightSample('user', 300);
+const calibrated = _messageVirtualEstimatedHeightForRole('user');
+// A different role is unaffected by another role's samples.
+const otherRole = _messageVirtualEstimatedHeightForRole('tool_call');
+// Garbage samples are ignored rather than poisoning the mean.
+_recordMessageVirtualRoleHeightSample('user', 0);
+_recordMessageVirtualRoleHeightSample('user', NaN);
+_recordMessageVirtualRoleHeightSample('user', -5);
+const afterGarbage = _messageVirtualEstimatedHeightForRole('user');
+// A session switch drops the calibration.
+_resetMessageVirtualRoleHeightStats();
+const afterReset = _messageVirtualEstimatedHeightForRole('user');
+
+console.log(JSON.stringify({seeded, belowFloor, calibrated, otherRole, afterGarbage, afterReset}));
+"""
+    out = json.loads(_run_node(source))
+    assert out["seeded"] == 120, "no samples yet -> static seed"
+    assert out["belowFloor"] == 120, "under the sample floor -> still the static seed"
+    assert out["calibrated"] == 300, (
+        "with enough samples the unmeasured-row estimate must come from the "
+        "measurements, not the static constant — this is the whole fix"
+    )
+    assert out["otherRole"] == 400, "one role's samples must not leak into another"
+    assert out["afterGarbage"] == 300, "non-positive / non-finite samples must be ignored"
+    assert out["afterReset"] == 120, "clearing the height cache must drop the calibration"
+
+
 def test_message_virtual_window_cached_heights_override_role_defaults():
     """Verify cached heights take precedence over role-specific defaults."""
     js = UI_JS_PATH.read_text(encoding="utf-8")
@@ -717,6 +839,9 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS={
 const MESSAGE_VIRTUAL_THRESHOLD_ROWS = 80;
 const MESSAGE_VIRTUAL_BUFFER_PX = 900;
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+eval(extractFunc('_messageVirtualEstimatedHeightForRole'));
 eval(extractFunc('_messageVirtualWindow'));
 const visWithIdx = [
   {m: {role: 'user'}},  // normally 120
@@ -787,6 +912,9 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {
   default: 140,
 };
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+eval(extractFunc('_messageVirtualEstimatedHeightForRole'));
 eval(extractFunc('_messageVirtualRoleForEntry'));
 
 // Three entries: user (120), tool_call (400), assistant (160) — all uncached (height=0)
@@ -1119,6 +1247,12 @@ const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHT = 140;
 const MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS = {user:120, assistant:160, tool_call:400, default:140};
 function clearTimeout(id){ timerCleared = (id === 99); }
 eval(extractFunc('_messageVirtualDefaultHeightForRole'));
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN = 3;
+let _messageVirtualRoleHeightStats = Object.create(null);
+eval(extractFunc('_messageVirtualEstimatedHeightForRole'));
+// _clearMessageVirtualHeightCache also drops the per-role measured samples so a
+// new session cannot inherit the previous transcript's calibration.
+eval(extractFunc('_resetMessageVirtualRoleHeightStats'));
 eval(extractFunc('_clearMessageVirtualHeightCache'));
 _clearMessageVirtualHeightCache();
 console.log(JSON.stringify({
@@ -1140,4 +1274,185 @@ console.log(JSON.stringify({
     )
     assert metrics["timerCleared"] is True, (
         "_clearMessageVirtualHeightCache must call clearTimeout on the pending settle timer"
+    )
+
+
+def _post_process_anchor_hold_harness(
+    *,
+    touch_like: str = "false",
+    scroll_top: int = 1100,
+    scroll_height: int = 5000,
+    bump_generation: str = "false",
+) -> str:
+    """Fake-DOM harness for the desktop post-process anchor hold.
+
+    Models the real failure: three rendered rows, the reader scrolled up so the
+    first one straddles the viewport top, and a post-process pass that grows
+    content ABOVE the viewport by 64px (Prism highlight + the .code-copy-btn this
+    pass injects into every .pre-header). Runs the REAL
+    _captureMessageViewportAnchor / _restoreMessageViewportAnchor /
+    _beginPostProcessAnchorHold / _postProcessWithAnchorSuppression.
+    """
+    return """
+const GROWTH = 64;
+let growth = 0;
+let scrollTopValue = %(scroll_top)d;
+const scrollHistory = [];
+const rows = [0, 1, 2].map(i => ({
+  contentTop: 1000 + i * 300,
+  dataset: {
+    msgIdx: String(40 + i),
+    sessionMsgIdx: String(140 + i),
+    messageAnchorKey: 'k' + i,
+  },
+  getClientRects(){ return [{}]; },
+  getBoundingClientRect(){
+    const top = (this.contentTop + growth) - scrollTopValue;
+    return {top, bottom: top + 300, height: 300};
+  },
+}));
+const container = {
+  clientHeight: 600,
+  get scrollHeight(){ return %(scroll_height)d + growth; },
+  get scrollTop(){ return scrollTopValue; },
+  set scrollTop(v){ scrollHistory.push(Math.round(v)); scrollTopValue = v; },
+  getBoundingClientRect(){ return {top: 0, bottom: 600, height: 600}; },
+  querySelectorAll(sel){
+    if(sel === '[data-msg-idx]' || sel === '[data-message-anchor-key]') return rows;
+    return [];
+  },
+  querySelector(sel){
+    const m = /^\\[data-session-msg-idx="(\\d+)"\\]$/.exec(sel);
+    if(m) return rows.find(r => r.dataset.sessionMsgIdx === m[1]) || null;
+    const r = /^\\[data-msg-idx="(\\d+)"\\]$/.exec(sel);
+    if(r) return rows.find(x => x.dataset.msgIdx === r[1]) || null;
+    return null;
+  },
+  style: {},
+};
+function $(id){ return id === 'messages' ? container : null; }
+function getComputedStyle(){ return {overflowAnchor: 'none'}; }
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _lastScrollTop = 0;
+let _lastMessageClientHeight = 0;
+let _messageScrollInputGeneration = 7;
+const performance = { now(){ return 1000; } };
+function requestAnimationFrame(cb){ cb(); return 1; }
+function setTimeout(cb){ cb(); return 1; }
+function _deferClearProgrammaticScroll(){ _programmaticScroll = false; }
+function _recentMessageScrollIntent(){ return false; }
+function _recentMessageTouchScrollIntent(){ return false; }
+function _isTouchLikeMessageViewport(){ return %(touch_like)s; }
+function _suppressBrowserOverflowAnchor(){ return null; }
+function _messageSessionIndexForRawIdx(n){ return n; }
+let postProcessRan = false;
+function postProcessRenderedMessages(){
+  postProcessRan = true;
+  // Above-viewport growth: every rendered row is pushed down by GROWTH.
+  growth = GROWTH;
+  if(%(bump_generation)s) _messageScrollInputGeneration++;
+}
+const anchorOffset = () => Math.round(rows[0].getBoundingClientRect().top
+  - container.getBoundingClientRect().top);
+eval(extractFunc('_captureMessageViewportAnchor'));
+eval(extractFunc('_restoreMessageViewportAnchor'));
+eval(extractFunc('_beginPostProcessAnchorHold'));
+eval(extractFunc('_postProcessWithAnchorSuppression'));
+const offsetBefore = anchorOffset();
+_postProcessWithAnchorSuppression(container);
+console.log(JSON.stringify({
+  postProcessRan,
+  offsetBefore,
+  offsetAfter: anchorOffset(),
+  scrollHistory,
+  lastScrollTop: _lastScrollTop,
+}));
+""" % {
+        "touch_like": touch_like,
+        "scroll_top": scroll_top,
+        "scroll_height": scroll_height,
+        "bump_generation": bump_generation,
+    }
+
+
+def test_post_process_holds_desktop_anchor_against_above_viewport_growth():
+    """#5637 follow-up: the virtualize_transcript backward creep.
+
+    postProcessRenderedMessages() runs one frame AFTER the JS anchor restore and
+    grows rows above the viewport. Desktop `.messages` is overflow-anchor:none,
+    so without an explicit JS hold the reader slides backward by that growth on
+    EVERY render and the next capture bakes the drifted offset in (measured
+    +646px over 12 streamed appends on a 2000-message session).
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    metrics = json.loads(
+        _run_node(_extract_func_script(js) + _post_process_anchor_hold_harness())
+    )
+    assert metrics["postProcessRan"] is True
+    assert metrics["offsetBefore"] == -100
+    assert metrics["scrollHistory"] == [1164], (
+        "desktop must realign scrollTop by the +64px of above-viewport growth the "
+        "post-process introduced; got %r" % (metrics["scrollHistory"],)
+    )
+    assert metrics["offsetAfter"] == -100, (
+        "the anchor row must end where the reader left it, not %rpx lower"
+        % (metrics["offsetAfter"] + 100,)
+    )
+    assert metrics["lastScrollTop"] == 1164, (
+        "_lastScrollTop must be synced after the programmatic hold so sticky-unpin "
+        "cannot false-trigger (#1731)"
+    )
+
+
+def test_post_process_anchor_hold_is_inert_on_touch_viewports():
+    """Touch keeps the native overflow-anchor engine as its hold (#5637/#5392).
+
+    Adding a JS write there would stack with the browser's own compensation —
+    the mobile yank _postProcessWithAnchorSuppression exists to prevent.
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    metrics = json.loads(
+        _run_node(
+            _extract_func_script(js)
+            + _post_process_anchor_hold_harness(touch_like="true")
+        )
+    )
+    assert metrics["postProcessRan"] is True
+    assert metrics["scrollHistory"] == [], (
+        "no JS scroll write may happen on a touch viewport; got %r"
+        % (metrics["scrollHistory"],)
+    )
+
+
+def test_post_process_anchor_hold_skips_tail_followers():
+    """A reader following the live tail is bound to the BOTTOM, not to a row."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    metrics = json.loads(
+        _run_node(
+            _extract_func_script(js)
+            # bottom = 1900 - 1100 - 600 = 200 <= 250 (readerAwayFromBottom idiom)
+            + _post_process_anchor_hold_harness(scroll_height=1900)
+        )
+    )
+    assert metrics["postProcessRan"] is True
+    assert metrics["scrollHistory"] == [], (
+        "a near-bottom tail follower must not be anchor-held; got %r"
+        % (metrics["scrollHistory"],)
+    )
+
+
+def test_post_process_anchor_hold_yields_to_reader_input():
+    """Reader input during the pass wins: the monotonic generation abandons the hold."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    metrics = json.loads(
+        _run_node(
+            _extract_func_script(js)
+            + _post_process_anchor_hold_harness(bump_generation="true")
+        )
+    )
+    assert metrics["postProcessRan"] is True
+    assert metrics["scrollHistory"] == [], (
+        "a scroll-input generation bump during the post-process must abandon the "
+        "hold; got %r" % (metrics["scrollHistory"],)
     )

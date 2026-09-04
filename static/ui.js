@@ -536,6 +536,48 @@ function _messageVirtualDefaultHeightForRole(role){
     role&&Object.prototype.hasOwnProperty.call(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS,role)?role:'default'
   ];
 }
+// #4343 root cause: the constants above are a one-number-per-role guess, and only
+// the rows that have entered the render window ever get a real measurement — on a
+// 2000-row session that was ~45 rows, leaving 98% of the virtual scroll geometry
+// built from the guess. The guesses are wrong in both directions (measured median
+// 214 against user:120 / assistant:160 / tool_call:400), so the errors do not
+// cancel: total scroll height came out ~34% short of the real transcript, topPad
+// disagreed with the DOM, and the anchor-restore pass fought that mismatch on every
+// scroll — the oscillation that got virtualization defaulted off for everyone.
+//
+// _updateMessageVirtualMeasurements already computed a measurement-derived mean
+// into _messageVirtualEstimatedRowHeight, and _currentMessageVirtualWindow already
+// passed it down as `defaultHeight` — but _messageVirtualWindow's rowHeightFor only
+// consults `defaultHeight` when no roleForIdx is supplied, and it always is. So the
+// calibrated number was dead code and every unmeasured row kept the static guess.
+//
+// Keep a running mean PER ROLE instead (a tool_call row and a user row have very
+// different real heights, so a single global mean would be worse than the constants
+// for the common case) and use it for unmeasured rows. Roles fall back to their
+// static seed until they have samples, so first paint is unchanged.
+const MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN=3;
+let _messageVirtualRoleHeightStats=Object.create(null);
+function _resetMessageVirtualRoleHeightStats(){
+  _messageVirtualRoleHeightStats=Object.create(null);
+}
+function _recordMessageVirtualRoleHeightSample(role, height){
+  const h=Number(height);
+  if(!Number.isFinite(h)||h<=0) return;
+  const key=role||'default';
+  const stat=_messageVirtualRoleHeightStats[key]||(_messageVirtualRoleHeightStats[key]={count:0,total:0});
+  stat.count++;
+  stat.total+=h;
+}
+// The estimate an UNMEASURED row of this role should contribute to the scroll
+// geometry: the measured mean once the role has enough samples to be meaningful,
+// otherwise the static seed.
+function _messageVirtualEstimatedHeightForRole(role){
+  const stat=_messageVirtualRoleHeightStats[role||'default'];
+  if(stat&&stat.count>=MESSAGE_VIRTUAL_ROLE_SAMPLE_MIN&&stat.total>0){
+    return Math.max(1, Math.round(stat.total/stat.count));
+  }
+  return _messageVirtualDefaultHeightForRole(role);
+}
 const MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS=2;
 let _messageRenderWindowSid=null;
 let _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
@@ -592,6 +634,7 @@ function _clearMessageVirtualHeightCache(){
   _messageVirtualHeightCacheLen=0;
   _messageVirtualHeightCacheSrc=null;
   _messageVirtualEstimatedRowHeight=_messageVirtualDefaultHeightForRole('default');
+  _resetMessageVirtualRoleHeightStats();
   _messageVirtualWindowKey='';
   _messageVirtualMeasurementCycleKey='';
   _messageVirtualMeasurementRetryCount=0;
@@ -654,7 +697,11 @@ function _messageVirtualWindow(opts){
   const rowHeightFor=(idx)=>{
     const cached=Number(heights[idx]);
     if(Number.isFinite(cached)&&cached>0) return cached;
-    return roleForIdx?Math.max(1,_messageVirtualDefaultHeightForRole(roleForIdx(idx))):defaultHeight;
+    // Unmeasured: the role's measured mean once it has samples, else its static
+    // seed. Previously this branch always took the static seed (roleForIdx is
+    // always supplied), which made `defaultHeight` dead and left the geometry
+    // uncalibrated — the #4343 oscillation.
+    return roleForIdx?Math.max(1,_messageVirtualEstimatedHeightForRole(roleForIdx(idx))):defaultHeight;
   };
   if(total<=Math.max(threshold, keepTailCount)){
     return {virtualized:false,start:0,end:total,topPad:0,bottomPad:0,total,tailStart};
@@ -855,7 +902,7 @@ function _messageVirtualPrependedHeightDelta(prependedRenderableCount){
   let total=0;
   for(let i=0;i<limit;i++){
     const cached=Number(_messageVirtualHeightCache[i]);
-    total+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualDefaultHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
+    total+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualEstimatedHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
   }
   return Math.max(0,Math.round(total));
 }
@@ -926,7 +973,7 @@ function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container
   let offset=0;
   for(let i=0;i<limit;i++){
     const cached=Number(_messageVirtualHeightCache[i]);
-    offset+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualDefaultHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
+    offset+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualEstimatedHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
   }
   const viewport=container?Math.max(0,Number(container.clientHeight)||0):0;
   return Math.max(0,Math.round(offset-(viewport*0.35)));
@@ -1371,6 +1418,9 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
     if(totalHeight<=0) continue;
     const visibleIdx=Number(renderVisibleIdxs&&renderVisibleIdxs[vi]);
     if(!Number.isFinite(visibleIdx)) continue;
+    // Feed the per-role running mean so the rows that never enter the window
+    // stop contributing a static guess to the scroll geometry (#4343).
+    _recordMessageVirtualRoleHeightSample(_messageVirtualRoleForEntry(entry), totalHeight);
     if(Math.abs((Number(_messageVirtualHeightCache[visibleIdx])||0)-totalHeight)>1){
       _messageVirtualHeightCache[visibleIdx]=totalHeight;
       changed=true;
@@ -1569,6 +1619,35 @@ function _currentMessageRenderWindowSize(){
 }
 function _messageRenderableMessageCount(){
   return _getVisibleMessagesWithIdx().length;
+}
+// #6999 established the bound that the auto-expanding render window must never
+// grow to the whole loaded transcript. That size gates _messageHiddenBeforeCount()
+// (the load-older / jump-to-start affordances) and sets the render width for the
+// non-virtualized path, so an unbounded window turns every later renderMessages()
+// into a full-transcript rebuild — seconds per render on a multi-thousand-message
+// session, on every send, SSE batch and refresh.
+//
+// sessions.js's reload path applied that cap, but the two stream-completion sites
+// in messages.js ("expand so the done render doesn't hide Activity") did not: they
+// grew the window to every loaded row, so a single completed turn silently undid
+// the cap and the window ratcheted up and never came back down. Route all three
+// through this one helper so the bound cannot drift apart again.
+//
+// The cap is a growth ceiling, not a truncation: an already-larger window (an
+// explicit jump-to-start, "load earlier" paging) is left alone, because those are
+// deliberate user requests for more rows rather than incidental growth.
+const MESSAGE_RENDER_WINDOW_GROWTH_MULTIPLE=4;
+function _messageRenderWindowGrowthCap(){
+  return MESSAGE_RENDER_WINDOW_DEFAULT*MESSAGE_RENDER_WINDOW_GROWTH_MULTIPLE;
+}
+function _expandMessageRenderWindowForLoadedMessages(){
+  const current=_currentMessageRenderWindowSize();
+  if(typeof _messageRenderableMessageCount!=='function') return current;
+  _messageRenderWindowSize=Math.max(
+    current,
+    Math.min(_messageRenderableMessageCount(), _messageRenderWindowGrowthCap())
+  );
+  return _messageRenderWindowSize;
 }
 function _messageHiddenBeforeCount(){
   return Math.max(0,_messageRenderableMessageCount()-_currentMessageRenderWindowSize());
@@ -18188,6 +18267,24 @@ function renderMessages(options){
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
   }
+  // Record the window this render actually painted. _scheduleMessageVirtualizedRender()
+  // dedupes on this key ("the window hasn't moved, nothing to re-render"), and the
+  // scroll listener calls it on EVERY scroll event — including the scrollTop write
+  // _compensateScrollForMeasurementDelta() makes right after a re-render.
+  //
+  // Only the cached-HTML early-return branch above set this. That branch is gated on
+  // `sid !== _sessionHtmlCacheSid`, i.e. it only runs when switching TO a session, so
+  // every steady-state re-render of the CURRENT session left the key at '' — the guard
+  // could never match, and the compensation's own scroll write scheduled yet another
+  // full re-render. That closed a self-sustaining loop: render -> compensate (writes
+  // scrollTop) -> scroll event -> schedule -> render, forever, measured at ~10 renders
+  // per second on an idle 2000-message transcript with virtualization on, each one
+  // re-running the scroll-restore path. That is the #4343 "unusable when enabled".
+  //
+  // Set it on the normal path too, so a scroll event that does not actually move the
+  // virtual window is a no-op. Assigned AFTER the render (not at the top) so an early
+  // return above cannot claim a window it never painted.
+  _messageVirtualWindowKey=renderWindowKey;
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
   // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
   // not synchronously: inside this render sync stack the browser still reports a transient
@@ -19366,13 +19463,81 @@ async function regenerateResponse(btn) {
 // this rAF fires. Wrap the post-process (and the media-reflow frame right after
 // it) in the same suppression so the browser layer cannot re-anchor during the
 // async settle window. Desktop rests at `none`, so this is a no-op there.
+// Desktop post-process scroll-drift fix (issue #5637 follow-up; the
+// virtualize_transcript creep). The rAF-deferred post-process above runs AFTER
+// _restoreMessageViewportAnchor has already realigned the reader, and it GROWS
+// rows that sit ABOVE the viewport: Prism highlighting, the .code-copy-btn this
+// pass injects into every .pre-header, inline diff/csv/pdf/html hydration,
+// mermaid/katex. Nothing re-anchors after that growth.
+//
+// On a touch viewport the browser's native overflow-anchor engine absorbs it
+// (which is precisely why _postProcessWithAnchorSuppression must suppress the
+// engine for the JS write — otherwise the two stack, the #5637 mobile yank).
+// Desktop `.messages` rests at overflow-anchor:none, so on desktop NOTHING
+// absorbs it: the reader slides backward by the full above-viewport growth, and
+// the NEXT render's _captureMessageViewportAnchor records the already-drifted
+// offset as its new target, so the error ratchets instead of healing. Measured
+// on a 2000-message session with virtualize_transcript ON, reader scrolled up,
+// 12 streamed appends: +64px per append, +646px cumulative (~54px/render).
+// Virtualization is what makes it constant: every append shifts the virtual
+// window, so the rows above the viewport are rebuilt as FRESH elements and get
+// post-processed (and re-grown) again on every single render.
+//
+// The fix is NOT to refuse the realign — see the #5637 gate comment in
+// _restoreMessageViewportAnchor: on desktop, refusing leaves the reader unheld,
+// which is the regression that gate exists to prevent. It is to EXTEND the
+// realign across the post-process, giving desktop in JS the same hold the touch
+// path gets from the engine: snapshot the viewport anchor before the pass, and
+// realign to it after.
+//
+// Returns null (no hold) when:
+//   - the native engine is active for this viewport (_isTouchLikeMessageViewport)
+//     -> touch/Android keeps its existing behavior unchanged; and even if this
+//     gate were ever wrong, _restoreMessageViewportAnchor's own #5637 refusal
+//     would decline the write there anyway (content grew, no input intent).
+//   - the reader is following the tail (bottom<=250, the readerAwayFromBottom
+//     idiom of _captureMessageScrollSnapshot): a pinned follower must stay bound
+//     to the BOTTOM, not to a row, and the pin path owns scrollTop for them.
+//   - there is no scroller or no anchor row to hold.
+// The applied hold is additionally abandoned when the reader took over during
+// the pass (_messageScrollInputGeneration moved): the monotonic generation is
+// the same ownership token the delayed snapshot restores use.
+function _beginPostProcessAnchorHold(scroller){
+  if(!scroller) return null;
+  if(typeof _captureMessageViewportAnchor!=='function'||typeof _restoreMessageViewportAnchor!=='function') return null;
+  // Only where the browser will NOT hold the reader itself.
+  if(typeof _isTouchLikeMessageViewport==='function'&&_isTouchLikeMessageViewport(scroller)) return null;
+  const bottom=Number(scroller.scrollHeight)-Number(scroller.scrollTop)-Number(scroller.clientHeight);
+  if(!(bottom>250)) return null;
+  const anchor=_captureMessageViewportAnchor();
+  if(!anchor) return null;
+  const generation=(typeof _messageScrollInputGeneration==='number')?_messageScrollInputGeneration:0;
+  return function _holdPostProcessAnchor(){
+    const current=(typeof _messageScrollInputGeneration==='number')?_messageScrollInputGeneration:generation;
+    if(current!==generation) return false;
+    const held=_restoreMessageViewportAnchor(anchor,0);
+    // Sync the scroll bookkeeping the anchor restore's callers own, so this
+    // programmatic shift cannot false-trigger sticky-unpin (#1731).
+    if(held){
+      if(typeof _lastScrollTop!=='undefined') _lastScrollTop=scroller.scrollTop;
+      if(typeof _lastMessageClientHeight!=='undefined') _lastMessageClientHeight=scroller.clientHeight;
+    }
+    return held;
+  };
+}
 function _postProcessWithAnchorSuppression(container){
   const scroller=$('messages');
   const release=(scroller&&typeof _suppressBrowserOverflowAnchor==='function')
     ? _suppressBrowserOverflowAnchor(scroller) : null;
+  // Desktop anchor hold across the pass (see _beginPostProcessAnchorHold above).
+  const holdAnchor=(typeof _beginPostProcessAnchorHold==='function')
+    ? _beginPostProcessAnchorHold(scroller) : null;
   try{
     postProcessRenderedMessages(container);
   }finally{
+    // The pass grew content above the viewport; on desktop this realign is the
+    // only thing holding the reader there. Runs before the suppression release.
+    if(holdAnchor){ try{ holdAnchor(); }catch(_){ } }
     // Hold suppression across ONE more frame so late media/layout reflow
     // (image decode, katex/mermaid measure) cannot re-anchor either, then let
     // _suppressBrowserOverflowAnchor's own rAF-deferred restore run.
